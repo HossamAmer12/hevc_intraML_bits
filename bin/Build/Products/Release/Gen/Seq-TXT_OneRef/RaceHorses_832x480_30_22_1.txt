@@ -1,0 +1,105 @@
+
+HM software: Encoder Version [16.0] (including RExt)[Mac OS X][GCC 4.2.1][64 bit] 
+
+
+Input          File               : /Volumes/DATA/TS/RaceHorses_832x480_30.yuv
+Bitstream      File               : Gen/Seq-265/RaceHorses_832x480_30_22_1.265
+Reconstruction File               : rec.yuv
+Real     Format                   : 832x480 30Hz
+Internal Format                   : 832x480 30Hz
+Sequence PSNR output              : Linear average only
+Sequence MSE output               : Disabled
+Frame MSE output                  : Disabled
+Frame/Field                       : Frame based coding
+Frame index                       : 0 - 2 (3 frames)
+Profile                           : main
+CU size / depth                   : 64 / 4
+RQT trans. size (min / max)       : 4 / 32
+Max RQT depth inter               : 3
+Max RQT depth intra               : 3
+Min PCM size                      : 8
+Motion search range               : 64
+Intra period                      : -1
+Decoding refresh type             : 0
+QP                                : 22.00
+Max dQP signaling depth           : 0
+Cb QP Offset                      : 0
+Cr QP Offset                      : 0
+Max CU chroma QP adjustment depth : -1
+QP adaptation                     : 0 (range=0)
+GOP size                          : 4
+Input bit depth                   : (Y:8, C:8)
+MSB-extended bit depth            : (Y:8, C:8)
+Internal bit depth                : (Y:8, C:8)
+PCM sample bit depth              : (Y:8, C:8)
+Extended precision processing     : Disabled
+Intra reference smoothing         : Enabled
+Implicit residual DPCM            : Disabled
+Explicit residual DPCM            : Disabled
+Residual rotation                 : Disabled
+Single significance map context   : Disabled
+Cross-component prediction        : Disabled
+High-precision prediction weight  : Disabled
+Golomb-Rice parameter adaptation  : Disabled
+CABAC bypass bit alignment        : Disabled
+Sao Luma Offset bit shifts        : 0
+Sao Chroma Offset bit shifts      : 0
+Cost function:                    : Lossy coding (default)
+RateControl                       : 0
+Max Num Merge Candidates          : 5
+
+TOOL CFG: IBD:0 HAD:1 RDQ:1 RDQTS:1 RDpenalty:0 SQP:0 ASR:0 FEN:1 ECU:0 FDM:1 CFM:0 ESD:0 RQT:1 TransformSkip:1 TransformSkipFast:1 TransformSkipLog2MaxSize:2 Slice: M=0 SliceSegment: M=0 CIP:0 SAO:1 PCM:0 TransQuantBypassEnabled:0 WPP:0 WPB:0 PME:2  WaveFrontSynchro:0 WaveFrontSubstreams:1 ScalingList:0 TMVPMode:1 AQpS:0 SignBitHidingFlag:1 RecalQP:0
+
+RExt Non-environment-variable-controlled macros set as follows: 
+
+                                RExt__DECODER_DEBUG_BIT_STATISTICS =   0
+                                      RExt__HIGH_BIT_DEPTH_SUPPORT =   0
+                            RExt__HIGH_PRECISION_FORWARD_TRANSFORM =   0
+                                  RExt__O0043_BEST_EFFORT_DECODING =   0
+                      RExt__BACKWARDS_COMPATIBILITY_HM_TICKET_1149 =   1
+                      RExt__BACKWARDS_COMPATIBILITY_HM_TICKET_1298 =   0
+           RExt__BACKWARDS_COMPATIBILITY_RBSP_EMULATION_PREVENTION =   0
+             RExt__BACKWARDS_COMPATIBILITY_MOTION_ESTIMATION_R0105 =   1
+
+Yang: TEncTop: create: I'm creating the GOP, Slice, CU Encoder 
+
+xInitRPS Inside TEncTop after the INIT: 
+                   Input ChromaFormatIDC =   4:2:0
+       Output (internal) ChromaFormatIDC =   4:2:0
+
+Yes I KNOW THAT I AM DOING ONLY PREV REFERENCE FOR ANALSIS: find me in Top ;) 
+Changing the code to hardcoded predicted and reference frame effect [P-P case] initSliceNew 
+POC    0 TId: 0 ( I-SLICE, nQP 22 QP 22 )     604200 bits [Y 42.3791 dB    U 43.4845 dB    V 44.0955 dB] [ET     5 ] [L0 ] [L1 ] [MD5:4c3ee3101847a3d0b367b841be8a540d,fe0cf75dc8fdf0423140bfbd792c302c,afa4a4bb96607759e7d6b8b5faa9ebc3]
+Yes I KNOW THAT I AM DOING ONLY PREV REFERENCE FOR ANALSIS: find me in Top ;) 
+Changing the code to hardcoded predicted and reference frame effect [P-P case] initSliceNew 
+POC    1 TId: 0 ( P-SLICE, nQP 31 QP 31 )      43848 bits [Y 34.4736 dB    U 39.1122 dB    V 40.4674 dB]OUTPUTTING THE MSE for reference and predicted frames 
+ [ET    10 ] [L0 0 ] [L1 ] [MD5:ca9b1d50239518fedcb2efc7c6972fe4,d2901466244a60b38bf9da7efce3a303,7044ab620eef0349d995f21205e47311]
+Yes I KNOW THAT I AM DOING ONLY PREV REFERENCE FOR ANALSIS: find me in Top ;) 
+Changing the code to hardcoded predicted and reference frame effect [P-P case] initSliceNew 
+POC    2 TId: 0 ( P-SLICE, nQP 32 QP 32 )      38104 bits [Y 33.5061 dB    U 38.4446 dB    V 39.7584 dB]OUTPUTTING THE MSE for reference and predicted frames 
+ [ET     9 ] [L0 1 ] [L1 ] [MD5:aacd5ca0e29dcd5360bc67ffe0d32ff8,187df0a4a33b3caa823ee9634c8948e0,40a2e3bfa3dbe0a08de868598b0744bf]
+
+
+SUMMARY --------------------------------------------------------
+	Total Frames |   Bitrate     Y-PSNR    U-PSNR    V-PSNR    YUV-PSNR 
+	        3    a    6861.5200   36.7863   40.3471   41.4405   36.5447
+
+
+I Slices--------------------------------------------------------
+	Total Frames |   Bitrate     Y-PSNR    U-PSNR    V-PSNR    YUV-PSNR 
+	        1    i   18126.0000   42.3791   43.4845   44.0955   42.7976
+
+
+P Slices--------------------------------------------------------
+	Total Frames |   Bitrate     Y-PSNR    U-PSNR    V-PSNR    YUV-PSNR 
+	        2    p    1229.2800   33.9899   38.7784   40.1129   35.1411
+
+
+B Slices--------------------------------------------------------
+	Total Frames |   Bitrate     Y-PSNR    U-PSNR    V-PSNR    YUV-PSNR 
+	        0    b          nan       nan       nan       nan       nan
+
+RVM: 0.000
+Bytes written to file: 85963 (6877.040 kbps)
+
+ Total Time:       24.524 sec.

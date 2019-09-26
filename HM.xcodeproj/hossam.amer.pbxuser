@@ -1,0 +1,137 @@
+// !$*UTF8*$!
+{
+	08FB7793FE84155DC02AAC07 /* Project object */ = {
+		activeBuildConfigurationName = Debug;
+		activeExecutable = 90EBAF4E19DB0099000B8656 /* TAppEncoder */;
+		activeTarget = 6767959311AD61BB00421804 /* TLibCommon */;
+		codeSenseManager = 90EBAF5919DB009D000B8656 /* Code sense */;
+		executables = (
+			90EBAF4E19DB0099000B8656 /* TAppEncoder */,
+			90EBAF4F19DB0099000B8656 /* TAppDecoder */,
+		);
+		perUserDictionary = {
+			PBXConfiguration.PBXFileTableDataSource3.PBXFileTableDataSource = {
+				PBXFileTableDataSourceColumnSortingDirectionKey = "-1";
+				PBXFileTableDataSourceColumnSortingKey = PBXFileDataSource_Filename_ColumnID;
+				PBXFileTableDataSourceColumnWidthsKey = (
+					20,
+					356,
+					20,
+					48,
+					43,
+					43,
+					20,
+				);
+				PBXFileTableDataSourceColumnsKey = (
+					PBXFileDataSource_FiletypeID,
+					PBXFileDataSource_Filename_ColumnID,
+					PBXFileDataSource_Built_ColumnID,
+					PBXFileDataSource_ObjectSize_ColumnID,
+					PBXFileDataSource_Errors_ColumnID,
+					PBXFileDataSource_Warnings_ColumnID,
+					PBXFileDataSource_Target_ColumnID,
+				);
+			};
+			PBXPerProjectTemplateStateSaveDate = 444007232;
+			PBXWorkspaceStateSaveDate = 444007232;
+		};
+		sourceControlManager = 90EBAF5819DB009D000B8656 /* Source Control */;
+		userBuildSettings = {
+		};
+	};
+	6767959311AD61BB00421804 /* TLibCommon */ = {
+		activeExec = 0;
+	};
+	676795F311AD621A00421804 /* TLibDecoder */ = {
+		activeExec = 0;
+	};
+	6767961811AD626F00421804 /* TLibEncoder */ = {
+		activeExec = 0;
+	};
+	6767964A11AD629200421804 /* TLibVideoIO */ = {
+		activeExec = 0;
+	};
+	6767966911AD635600421804 /* TAppEncoder */ = {
+		activeExec = 0;
+		executables = (
+			90EBAF4E19DB0099000B8656 /* TAppEncoder */,
+		);
+	};
+	6782E0DD11AD691A00E8FFB8 /* TAppDecoder */ = {
+		activeExec = 0;
+		executables = (
+			90EBAF4F19DB0099000B8656 /* TAppDecoder */,
+		);
+	};
+	7104E1CC12005ABA00F42AA8 /* TAppCommon */ = {
+		activeExec = 0;
+	};
+	90EBAF4E19DB0099000B8656 /* TAppEncoder */ = {
+		isa = PBXExecutable;
+		activeArgIndices = (
+		);
+		argumentStrings = (
+		);
+		autoAttachOnCrash = 1;
+		breakpointsEnabled = 0;
+		configStateDict = {
+		};
+		customDataFormattersEnabled = 1;
+		dataTipCustomDataFormattersEnabled = 1;
+		dataTipShowTypeColumn = 1;
+		dataTipSortType = 0;
+		debuggerPlugin = GDBDebugging;
+		disassemblyDisplayState = 0;
+		enableDebugStr = 1;
+		environmentEntries = (
+		);
+		executableSystemSymbolLevel = 0;
+		executableUserSymbolLevel = 0;
+		libgmallocEnabled = 0;
+		name = TAppEncoder;
+		showTypeColumn = 0;
+		sourceDirectories = (
+		);
+	};
+	90EBAF4F19DB0099000B8656 /* TAppDecoder */ = {
+		isa = PBXExecutable;
+		activeArgIndices = (
+		);
+		argumentStrings = (
+		);
+		autoAttachOnCrash = 1;
+		breakpointsEnabled = 0;
+		configStateDict = {
+		};
+		customDataFormattersEnabled = 1;
+		dataTipCustomDataFormattersEnabled = 1;
+		dataTipShowTypeColumn = 1;
+		dataTipSortType = 0;
+		debuggerPlugin = GDBDebugging;
+		disassemblyDisplayState = 0;
+		enableDebugStr = 1;
+		environmentEntries = (
+		);
+		executableSystemSymbolLevel = 0;
+		executableUserSymbolLevel = 0;
+		libgmallocEnabled = 0;
+		name = TAppDecoder;
+		showTypeColumn = 0;
+		sourceDirectories = (
+		);
+	};
+	90EBAF5819DB009D000B8656 /* Source Control */ = {
+		isa = PBXSourceControlManager;
+		fallbackIsa = XCSourceControlManager;
+		isSCMEnabled = 0;
+		scmConfiguration = {
+			repositoryNamesForRoots = {
+				"" = "";
+			};
+		};
+	};
+	90EBAF5919DB009D000B8656 /* Code sense */ = {
+		isa = PBXCodeSenseManager;
+		indexTemplatePath = "";
+	};
+}

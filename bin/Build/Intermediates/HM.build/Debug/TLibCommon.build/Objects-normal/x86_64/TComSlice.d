@@ -1,0 +1,39 @@
+dependencies: \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComSlice.cpp \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/CommonDef.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TypeDef.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComSlice.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComRom.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComList.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComChromaFormat.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComRectangle.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/ContextTables.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/Debug.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComPic.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComPicSym.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComDataCU.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComMotionInfo.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComMv.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComRdCost.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComPattern.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComRdCostWeightPrediction.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComPicYuv.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/SEI.h \
+  source/Lib/libmd5/MD5.h source/Lib/libmd5/libmd5.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComBitStream.h \
+  source/Lib/TLibEncoder/TEncSbac.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/ContextModel.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/ContextModel3DBuffer.h \
+  source/Lib/TLibEncoder/TEncEntropy.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComTrQuant.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComYuv.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComSampleAdaptiveOffset.h \
+  source/Lib/TLibEncoder/TEncBinCoder.h \
+  source/Lib/TLibEncoder/TEncBinCoderCABAC.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComCABACTables.h \
+  source/Lib/TLibEncoder/TEncBinCoderCABACCounter.h \
+  source/Lib/TLibDecoder/TDecSbac.h source/Lib/TLibDecoder/TDecEntropy.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComPrediction.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComInterpolationFilter.h \
+  /Users/hossam.amer/7aS7aS_Works/work/workspace/TESTS/SC_RB_FullTest/source/Lib/TLibCommon/TComWeightPrediction.h \
+  source/Lib/TLibDecoder/TDecBinCoder.h

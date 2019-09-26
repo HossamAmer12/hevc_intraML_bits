@@ -1,0 +1,4152 @@
+//
+//  TEncSceneChange.cpp
+//  HM
+//
+//  Created by Hossam Amer on 2015-03-10.
+//
+//
+
+#include "TEncSceneChange.h"
+
+#include <list>
+#include <algorithm>
+#include <functional>
+
+#include "TEncTop.h"
+#include "TEncGOP.h"
+#include "TEncAnalyze.h"
+#include "libmd5/MD5.h"
+#include "TLibCommon/SEI.h"
+#include "TLibCommon/NAL.h"
+#include "NALwrite.h"
+#include <time.h>
+#include <math.h>
+
+using namespace std;
+
+
+#define MaxAmp 65536
+
+//#define MaxAmp 2^11
+#define LambdaDelta 0.1
+#define MinLikelyhood  -1.e30
+//(-(1<<30))
+#define StartPointProb 0.1
+
+typedef struct {
+    int count;
+    double AcumAbsAmp;
+    double AcumSampNum;
+    double prob;
+    double lambda;
+    double likelyhood ;
+} tBucket;
+
+// TCM
+double ComputeLambdaGivenYc(double Yc, double sumYi, double totalNumYi)
+{
+    double c = sumYi/totalNumYi ;
+    double lambda, lambda_old ;
+    
+    if( c/Yc>=0.95) return -1.0 ; // Too much away from Laplacian
+    
+    lambda_old = c ;
+    
+    lambda = c - Yc * (1.0 - 1.0/(1.0 - exp(-Yc/lambda_old)) ) ;
+    
+    { int k;
+        for(k=0;k<5;k++)
+        {
+            lambda_old = lambda ;
+            
+            lambda = c - Yc * (1.0 - 1.0/(1.0 - exp(-Yc/lambda_old)) ) ;
+        }
+    }
+    while( fabs(lambda - lambda_old) > LambdaDelta )
+    {
+        lambda_old = lambda ;
+        
+        lambda = c - Yc * (1.0 - 1.0/(1.0 - exp(-Yc/lambda_old)) ) ;
+    }
+    
+    return lambda ;
+    
+}
+
+
+int FindStartPoint(tBucket *buck, int peak, int N)
+{
+    int k ;
+    for(k=peak;k>0;k--)
+    {
+        if( buck[k].count==0) continue ;
+        
+        if( buck[k].AcumSampNum < N* (1.0-StartPointProb)) break ;
+    }
+    
+    if(buck[0].count>N/100 && buck[1].count>N/100 && buck[2].count>N/100  && buck[3].count>N/100)
+    {
+        if(k<3) k=3;
+    }
+    else if(buck[0].count>N/100 && buck[1].count>N/100 && buck[2].count>N/100 )
+    {
+        if(k<2) k=2;
+    }
+    else
+    {
+        if(k<1) k=1;
+    }
+    return k;
+}
+
+void  ComputeLikelyhood(int thePoint, int N, tBucket *buck, int peak)
+{
+    
+    double N1 = buck[thePoint].AcumSampNum ;
+    
+    double N2 = N - N1 ;
+    double Yc = thePoint ;
+    
+    double sumYi = buck[thePoint].AcumAbsAmp ;
+    double totalNumYi = buck[thePoint].AcumSampNum ;
+    
+    double lambda =  ComputeLambdaGivenYc(Yc,  sumYi, totalNumYi) ;
+    
+    double prob = (double)N1 / (double)N ;
+    
+    if(lambda>0)
+    {
+        buck[thePoint].likelyhood = N2 * log(1- prob) + N1 * log(prob) - N2 * log( (peak - Yc)*2.0)
+        -N1 * log(1-exp(-Yc/lambda))
+        -N1 * log(2*lambda) - sumYi/lambda ;
+        
+        buck[thePoint].lambda = lambda ;
+        buck[thePoint].prob = prob ;
+    }
+    else
+    {
+        buck[thePoint].likelyhood = -MinLikelyhood ;
+        
+        buck[thePoint].lambda = lambda ;
+        buck[thePoint].prob = 1 ;
+    }
+}
+
+// Hossam: Modify the input to match the thing
+//void TCMprocessOneSequence(int *C, int Len, int *peak, double*prob, double *lambda, double*Yc )
+void TCMprocessOneSequence(Pel *C, int Len, int *peak, double*prob, double *lambda, double*Yc )
+{
+    int k, MaxPos, StartPoint;
+    double MaxLikelyhood, likelyhood ;
+    tBucket buck[MaxAmp];
+    
+    *peak = 0 ;
+    for(k=0;k<Len;k++)
+    {
+        int absv = abs(C[k]);
+        if(absv> (*peak) ) *peak = absv ;
+    }
+    
+    if( *peak ==0 || *peak>=MaxAmp  )
+    {
+        printf("Input data either all zero or exceed %d (%d)\n", MaxAmp, *peak);
+        
+        *lambda = -1 ;
+        *Yc = 0;
+        *prob = 1 ;
+        return ;
+    }
+    
+    for(k=0;k<= (*peak);k++)
+    {
+        buck[ k ].count = 0 ;
+        buck[ k ].AcumAbsAmp = 0 ;
+        buck[ k ].AcumSampNum = 0 ;
+    }
+    
+    for(k=0;k<Len;k++)
+    {
+        int cabs = abs(C[k]);
+        buck[ cabs ].count ++ ;
+    }
+    buck[0].AcumSampNum = buck[0].count ;
+    
+    for(k=1;k<= (*peak);k++)
+    {
+        buck[ k ].AcumAbsAmp  = buck[ k-1 ].AcumAbsAmp + k * buck[ k ].count ;
+        buck[ k ].AcumSampNum = buck[ k-1 ].AcumSampNum + buck[ k ].count ;
+    }
+    
+    // saftey check
+    if(buck[0].count < (buck[1].count>>1) || buck[1].count < (buck[2].count>>1))
+    {
+        *lambda = -1 ;
+        *Yc = 0;
+        *prob = 1 ;
+        return ;
+    }
+    
+    StartPoint = FindStartPoint(buck, *peak, Len);
+    
+    //if( StartPoint<=0 )
+    //{
+    //    *prob = 1 ;
+    //    *lambda = -1 ;
+    //    *Yc = 0 ;
+    //    printf("Data distribution is not like Laplacian1\n");
+    //    return ;
+    //}
+    
+    ComputeLikelyhood(StartPoint, Len, buck, *peak)  ;
+    
+    MaxLikelyhood = buck[StartPoint].likelyhood ;
+    
+    MaxPos = StartPoint ;
+    for(k=StartPoint+1; k<=(*peak); k++)
+    {
+        if(buck[k].count==0) continue ;
+        
+        ComputeLikelyhood(k, Len, buck, *peak)  ;
+        
+        likelyhood = buck[k].likelyhood ;
+        
+        if( likelyhood > MaxLikelyhood)
+        {
+            MaxPos = k ;
+            MaxLikelyhood = likelyhood ;
+        }
+    }
+    
+    if( MaxLikelyhood > MinLikelyhood)
+    {
+        *prob = buck[MaxPos].prob ;
+        *lambda = buck[MaxPos].lambda ;
+        *Yc = MaxPos ;
+    }
+    else  // the search failed
+    {
+        *prob = 1 ;
+        *lambda = -1 ;
+        *Yc = 0 ;
+        // QQQQ printf("Data distribution is not like Laplacian2\n");
+    }
+}
+
+void TCMprocessOneSequence2(int *C, int Len, int *peak, double*prob, double *lambda, double*Yc )
+{
+    int k, MaxPos, StartPoint;
+    double MaxLikelyhood, likelyhood ;
+    tBucket buck[MaxAmp];
+    
+    *peak = 0 ;
+    for(k=0;k<Len;k++)
+    {
+        int absv = abs(C[k]);
+        if(absv> (*peak) ) *peak = absv ;
+    }
+    
+    if( *peak ==0 || *peak>=MaxAmp  )
+    {
+        printf("Input data either all zero or exceed %d (%d)\n", MaxAmp, *peak);
+        
+        *lambda = -1 ;
+        *Yc = 0;
+        *prob = 1 ;
+        return ;
+    }
+    
+    for(k=0;k<= (*peak);k++)
+    {
+        buck[ k ].count = 0 ;
+        buck[ k ].AcumAbsAmp = 0 ;
+        buck[ k ].AcumSampNum = 0 ;
+    }
+    
+    for(k=0;k<Len;k++)
+    {
+        int cabs = abs(C[k]);
+        buck[ cabs ].count ++ ;
+    }
+    buck[0].AcumSampNum = buck[0].count ;
+    
+    for(k=1;k<= (*peak);k++)
+    {
+        buck[ k ].AcumAbsAmp  = buck[ k-1 ].AcumAbsAmp + k * buck[ k ].count ;
+        buck[ k ].AcumSampNum = buck[ k-1 ].AcumSampNum + buck[ k ].count ;
+    }
+    
+    // saftey check
+    if(buck[0].count < (buck[1].count>>1) || buck[1].count < (buck[2].count>>1))
+    {
+        *lambda = -1 ;
+        *Yc = 0;
+        *prob = 1 ;
+        return ;
+    }
+    
+    StartPoint = FindStartPoint(buck, *peak, Len);
+    
+    //if( StartPoint<=0 )
+    //{
+    //    *prob = 1 ;
+    //    *lambda = -1 ;
+    //    *Yc = 0 ;
+    //    printf("Data distribution is not like Laplacian1\n");
+    //    return ;
+    //}
+    
+    ComputeLikelyhood(StartPoint, Len, buck, *peak)  ;
+    
+    MaxLikelyhood = buck[StartPoint].likelyhood ;
+    
+    MaxPos = StartPoint ;
+    for(k=StartPoint+1; k<=(*peak); k++)
+    {
+        if(buck[k].count==0) continue ;
+        
+        ComputeLikelyhood(k, Len, buck, *peak)  ;
+        
+        likelyhood = buck[k].likelyhood ;
+        
+        if( likelyhood > MaxLikelyhood)
+        {
+            MaxPos = k ;
+            MaxLikelyhood = likelyhood ;
+        }
+    }
+    
+    if( MaxLikelyhood > MinLikelyhood)
+    {
+        *prob = buck[MaxPos].prob ;
+        *lambda = buck[MaxPos].lambda ;
+        *Yc = MaxPos ;
+    }
+    else  // the search failed
+    {
+        *prob = 1 ;
+        *lambda = -1 ;
+        *Yc = 0 ;
+        // QQQQ printf("Data distribution is not like Laplacian2\n");
+    }
+}
+
+
+// --end TCM
+
+
+//! \ingroup TLibEncoder
+//! \{
+
+// ====================================================================================================================
+// Constructor / destructor / initialization / destroy
+// ====================================================================================================================
+TEncSceneChange::TEncSceneChange()
+{
+    m_iLastIDR            = 0;
+    m_iGopSize            = 0;
+    m_iNumPicCoded        = 0; //Niko
+    m_bFirst              = true;
+#if ALLOW_RECOVERY_POINT_AS_RAP
+    m_iLastRecoveryPicPOC = 0;
+#endif
+    
+    m_pcCfg               = NULL;
+    m_pcSliceEncoder      = NULL;
+    m_pcListPic           = NULL;
+    
+    m_pcEntropyCoder      = NULL;
+    m_pcCavlcCoder        = NULL;
+    m_pcSbacCoder         = NULL;
+    m_pcBinCABAC          = NULL;
+    
+    m_bSeqFirst           = true;
+    
+    m_bRefreshPending     = 0;
+    m_pocCRA            = 0;
+    m_numLongTermRefPicSPS = 0;
+    ::memset(m_ltRefPicPocLsbSps, 0, sizeof(m_ltRefPicPocLsbSps));
+    ::memset(m_ltRefPicUsedByCurrPicFlag, 0, sizeof(m_ltRefPicUsedByCurrPicFlag));
+    
+    // Scene change list
+    ::memset(m_scList, 0, sizeof(m_scList));
+    
+    // Initialize the last SC
+    //    m_iLastSC = 0;
+    m_iLastSC = -1;
+    
+    // Initilize the sum of the Yc so far
+    sumYc = 0;
+    
+    // Initialize the initial Yc values
+    m_iCurrentYc = 0;
+    m_iLastYcSC  = 0;
+    
+    // Initilize the previous variance of the Yc values
+    prev_variance = 0;
+    
+    
+    // Init the current sigma squared
+    curr_sigmaSquared = 0;
+    
+    return;
+}
+
+TEncSceneChange::~TEncSceneChange()
+{
+    ycArray.clear();
+}
+
+/** Create list to contain pointers to LCU start addresses of slice.
+ */
+Void  TEncSceneChange::create()
+{
+    m_bLongtermTestPictureHasBeenCoded = 0;
+    m_bLongtermTestPictureHasBeenCoded2 = 0;
+    
+}
+
+Void  TEncSceneChange::destroy()
+{
+}
+
+Void TEncSceneChange::init ( TEncTop* pcTEncTop )
+{
+    m_pcEncTop             = pcTEncTop;
+    m_pcCfg                = pcTEncTop;
+    m_pcSliceEncoder       = pcTEncTop->getSliceEncoder();
+    m_pcListPic            = pcTEncTop->getListPic();
+    
+    m_pcEntropyCoder       = pcTEncTop->getEntropyCoder();
+    m_pcCavlcCoder         = pcTEncTop->getCavlcCoder();
+    m_pcSbacCoder          = pcTEncTop->getSbacCoder();
+    m_pcBinCABAC           = pcTEncTop->getBinCABAC();
+    m_pcLoopFilter         = pcTEncTop->getLoopFilter();
+    m_pcBitCounter         = pcTEncTop->getBitCounter();
+    
+    m_pcSAO                = pcTEncTop->getSAO();
+    m_pcRateCtrl           = pcTEncTop->getRateCtrl();
+    
+    // m_scList init with numbers
+    // m_scList = {-1, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130};
+    
+    // Initialize the Scene change array
+    //    m_scList[0] = -1;
+    //    m_scList[1] = 0;
+    /*
+     for (int i = 2; i < noSCs; i++) {
+     m_scList[i] = (i-1)*10;
+     
+     
+     cout << "YARA TAREK NEGM SC LIST: index: " << i  << ", val: " <<  m_scList[i] << endl;
+     }
+     */
+    //    - ElephantNew SCs:
+    //    [0,
+    //     34,
+    //     74,
+    //     103,
+    //     127,
+    //     580,
+    //     701,
+    //     898,
+    //     1053,
+    //     ]
+    
+    Int i = 0;
+    //    m_scList[i]   = 11;
+    //    m_scList[++i] = 17;
+    //    m_scList[++i] = 25;
+    
+//        m_scList[i]   = 0;
+//        m_scList[++i] = 27;
+//        m_scList[++i] = 58;
+//        m_scList[++i] = 77;
+//        m_scList[++i] = 108;
+//        m_scList[++i] = 133;
+
+    // BQ2
+//    m_scList[i]   = 0;
+//    m_scList[++i] = 499;
+//    m_scList[++i] = 798;
+//    m_scList[++i] = 1297;
+
+    // Racehorse high intra
+//    m_scList[i]   = 92;
+//    m_scList[++i] = 260;
+    
+    // BasketballPass with high intra
+    m_scList[i]   = 140;
+
+
+    
+    //    m_scList[++i] = 127;
+    //    m_scList[++i] = 580;
+    //    m_scList[++i] = 701;
+    //    m_scList[++i] = 898;
+    //    m_scList[++i] = 1053;// 1053 should be
+    
+    //    m_scList[i] = 5;
+    //    m_scList[++i] = 13;
+    ////    m_scList[++i] = 24;
+    
+    
+    
+    // Initialize the Scene change state
+    // Put it -1 to indicate that SC did not occur yet
+    m_iSCState = -1;
+    
+#if IS_YAO_SCD
+    // Yao variables
+    yao_intra_current_mean = yao_intra_prev_mean = yao_intra_prev_std = yao_intra_current_std
+    = yao_content_variation = yao_threshold = yao_tUP = yao_tDown = yao_thresholdFinal = yao_average_QP = 0;
+#endif
+    
+#if IS_SASTRE_SCD
+    sastre_avg_tillK = sastre_intra_count_tillK = sastre_span = sastre_Tf = sastre_Tlim = sastre_Ta = sastre_S = sastre_alpha = 0;
+#endif
+
+    
+}
+
+Bool TEncSceneChange::isSceneChangePOC(UInt POC)
+{
+    if (POC == 0) {
+        return false;
+    }
+    
+    Int size = sizeof(m_scList)/sizeof(m_scList[0]);
+    for (int i = 0; i < size; i++) {
+        
+//        cout << "POC " << m_scList[i] << ", size: " << size << endl;
+        if(m_scList[i] == POC)
+            return true;
+    }
+    
+    return false;
+    
+}
+
+
+// Get the sigma squared orig independent from the scene change calculations
+Double TEncSceneChange::getSigmaSquaredOrig(UInt POC, TComSlice* pcSlice, TComList<TComPic*>& rcListPic,  TComPic* pcPic, Int which_reference)
+{
+    if (POC == 0 || (POC == 1 && which_reference >= 1)) {
+
+#if GEN_SIGMA_FILES
+        cout << "\nOUTPUTTING THE sigma^2 orig for frame 0 and it's equal zero" << endl;
+        string fileName2 = "";
+        std::ostringstream oss2;
+      if(which_reference >= 1)
+        oss2 << "Gen//Seq-TXT//" << g_input_FileName << "_sigma_1_" << g_qpInit  << ".txt";
+     else
+        oss2 << "Gen//Seq-TXT//" << g_input_FileName << "_sigma" << g_qpInit  << ".txt";
+        
+        fileName2 = oss2.str();
+        Char* pYUVFileName2 = fileName2.empty()? NULL: strdup(fileName2.c_str());
+        FILE* mse_pFile2 = fopen (pYUVFileName2, "at");
+        fprintf(mse_pFile2, "%6.4lf\n", 0.0);
+        fclose(mse_pFile2);
+#endif
+        curr_sigmaSquared = -1;
+        return curr_sigmaSquared;
+    }
+    
+    if (m_pcCfg->getUseASR()) // adaptive search range
+    {
+        m_pcSliceEncoder->setSearchRange(pcSlice);
+    }
+    
+    Bool bGPBcheck=false;
+    
+    // Variance, mean
+    Double variance, mean = -1;
+    
+    /// >>>>>>>> IBBB-lowDelay    <<<<<<<<<
+    // Hossam: Removed case for B-slice check, set the MVD to false now
+    if ( pcSlice->getSliceType() == B_SLICE)
+    {
+        if ( pcSlice->getNumRefIdx(RefPicList( 0 ) ) == pcSlice->getNumRefIdx(RefPicList( 1 ) ) )
+        {
+            bGPBcheck=true;
+            Int i;
+            for ( i=0; i < pcSlice->getNumRefIdx(RefPicList( 1 ) ); i++ )
+            {
+                if ( pcSlice->getRefPOC(RefPicList(1), i) != pcSlice->getRefPOC(RefPicList(0), i) )
+                {
+                    bGPBcheck=false;
+                    break;
+                }
+            }
+        }
+    }
+    if(bGPBcheck)
+    {
+        pcSlice->setMvdL1ZeroFlag(true);
+    }
+    else
+    {
+        pcSlice->setMvdL1ZeroFlag(false);
+    }
+    
+    pcPic->getSlice(pcSlice->getSliceIdx())->setMvdL1ZeroFlag(pcSlice->getMvdL1ZeroFlag());
+    
+    UInt uiNumSlices = 1;
+    
+    UInt uiInternalAddress = pcPic->getNumPartInCU()-4;
+    UInt uiExternalAddress = pcPic->getPicSym()->getNumberOfCUsInFrame()-1;
+    UInt uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiWidth = pcSlice->getSPS()->getPicWidthInLumaSamples();
+    UInt uiHeight = pcSlice->getSPS()->getPicHeightInLumaSamples();
+    while(uiPosX>=uiWidth||uiPosY>=uiHeight)
+    {
+        uiInternalAddress--;
+        uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+        uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    }
+    uiInternalAddress++;
+    if(uiInternalAddress==pcPic->getNumPartInCU())
+    {
+        uiInternalAddress = 0;
+        uiExternalAddress++;
+    }
+    UInt uiRealEndAddress = uiExternalAddress*pcPic->getNumPartInCU()+uiInternalAddress;
+    
+    Int  p;
+    UInt uiEncCUAddr;
+    
+    pcPic->getPicSym()->initTiles(pcSlice->getPPS());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    const Int iNumSubstreams = pcSlice->getPPS()->getNumSubstreams();
+    
+    
+    for(p=0, uiEncCUAddr=0; p<pcPic->getPicSym()->getNumberOfCUsInFrame(); p++, uiEncCUAddr = pcPic->getPicSym()->xCalculateNxtCUAddr(uiEncCUAddr))
+    {
+        
+        pcPic->getPicSym()->setCUOrderMap(p, uiEncCUAddr);
+        pcPic->getPicSym()->setInverseCUOrderMap(uiEncCUAddr, p);
+    }
+    pcPic->getPicSym()->setCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    pcPic->getPicSym()->setInverseCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    //        Hossam: I don't think this step is necessary for now: XXXX let's see, yes it's not necessary
+//    m_pcEncTop->createWPPCoders(iNumSubstreams);
+    //        pcSbacCoders = m_pcEncTop->getSbacCoders();
+    //        pcSubstreamsOut = new TComOutputBitstream[iNumSubstreams];
+    
+    UInt startCUAddrSliceIdx = 0; // used to index "m_uiStoredStartCUAddrForEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSlice    = 0; // used to keep track of current slice's starting CU addr.
+    pcSlice->setSliceCurStartCUAddr( startCUAddrSlice ); // Setting "start CU addr" for current slice
+    m_storedStartCUAddrForEncodingSlice.clear();
+    
+    UInt startCUAddrSliceSegmentIdx = 0; // used to index "m_uiStoredStartCUAddrForEntropyEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSliceSegment    = 0; // used to keep track of current Dependent slice's starting CU addr.
+    pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment ); // Setting "start CU addr" for current Dependent slice
+    
+    m_storedStartCUAddrForEncodingSliceSegment.clear();
+    UInt nextCUAddr = 0;
+    m_storedStartCUAddrForEncodingSlice.push_back (nextCUAddr);
+    startCUAddrSliceIdx++;
+    m_storedStartCUAddrForEncodingSliceSegment.push_back(nextCUAddr);
+    startCUAddrSliceSegmentIdx++;
+    
+    
+    // Compress Slice
+    while(nextCUAddr < uiRealEndAddress)
+    {
+        pcSlice->setNextSlice       ( false );
+        pcSlice->setNextSliceSegment( false );
+        assert(pcPic->getNumAllocatedSlice() == startCUAddrSliceIdx);
+        
+        // ==============================Compress slice step==============================
+        //  Slice compression using original references
+        m_pcSliceEncoder->precompressSliceNewOrg(pcPic);
+        m_pcSliceEncoder->compressSliceNewOrg(pcPic, which_reference);
+        
+        // Only for Y compononent
+        const ComponentID ch = ComponentID(COMPONENT_Y);
+        
+        TComPicYuv* data = pcPic->getPicYuvResi(); // get the residual frame
+        Pel* pData = data->getAddr(ch);
+        UInt uiStrideSrc = data->getStride(ch);
+        
+        const UInt uiFrameWidth = data->getWidth(ch);
+        const UInt uiFrameHeight = data->getHeight(ch);
+        
+        
+        // loop on the residual frame to obtain variance
+        Double sum = 0;
+        Double sum_sq = 0;
+        for (UInt height = 0 ; height< uiFrameHeight; height++)
+        {
+            for (UInt width = 0; width < uiFrameWidth; width++)
+            {
+                // Sum up the squared values of the difference
+                sum += pData[width]*pData[width];
+                sum_sq += pData[width] * pData[width] * pData[width] * pData[width];
+            }// end inner loop
+            
+            pData += uiStrideSrc;
+        }// end outer loop
+        
+        // mean and variance calculations
+        mean = sum / (uiFrameWidth * uiFrameHeight);
+        variance = sum_sq /(uiFrameWidth * uiFrameHeight) - mean * mean;
+        curr_sigmaSquared = mean; // set them to the mean
+
+#if GEN_SIGMA_FILES
+        // Write the E(||Xpred - Xref||^2) in a file
+        cout << "\nOUTPUTTING THE sigma^2 orig for per frame" << endl;
+        string fileName2 = "";
+        std::ostringstream oss2;
+        if(which_reference >= 1)
+            oss2 << "Gen//Seq-TXT//" << g_input_FileName << "_sigma_1_" << g_qpInit  << ".txt";
+        else
+            oss2 << "Gen//Seq-TXT//" << g_input_FileName << "_sigma" << g_qpInit  << ".txt";
+        fileName2 = oss2.str();
+        Char* pYUVFileName2 = fileName2.empty()? NULL: strdup(fileName2.c_str());
+        FILE* mse_pFile2 = fopen (pYUVFileName2, "at");
+        fprintf(mse_pFile2, "%6.4lf\n", mean);
+        fclose(mse_pFile2);
+#endif
+        ///////////////////////////////////////////////////////
+
+        
+        // Probe to the address
+        Bool bNoBinBitConstraintViolated = (!pcSlice->isNextSlice() && !pcSlice->isNextSliceSegment());
+        if (pcSlice->isNextSlice() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSlice = pcSlice->getSliceCurEndCUAddr();
+            // Reconstruction slice
+            m_storedStartCUAddrForEncodingSlice.push_back(startCUAddrSlice);
+            startCUAddrSliceIdx++;
+            // Dependent slice
+            if (startCUAddrSliceSegmentIdx>0 && m_storedStartCUAddrForEncodingSliceSegment[startCUAddrSliceSegmentIdx-1] != startCUAddrSlice)
+            {
+                m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSlice);
+                startCUAddrSliceSegmentIdx++;
+            }
+            
+            // Hossam: This case is not visited so far! XXXX --> Because I am dealing with 1 slice/frame
+            if (startCUAddrSlice < uiRealEndAddress)
+            {
+                pcPic->allocateNewSlice();
+                
+                // Hossam: This case is not visited so far!
+                //            cout << "compressGOP: I am allocating a new Slice "  << endl;
+                pcPic->setCurrSliceIdx                  ( startCUAddrSliceIdx-1 );
+                m_pcSliceEncoder->setSliceIdx           ( startCUAddrSliceIdx-1 );
+                pcSlice = pcPic->getSlice               ( startCUAddrSliceIdx-1 );
+                pcSlice->copySliceInfo                  ( pcPic->getSlice(0)      );
+                pcSlice->setSliceIdx                    ( startCUAddrSliceIdx-1 );
+                pcSlice->setSliceCurStartCUAddr         ( startCUAddrSlice      );
+                pcSlice->setSliceSegmentCurStartCUAddr  ( startCUAddrSlice      );
+                pcSlice->setSliceBits(0);
+                uiNumSlices ++;
+            }
+        }
+        else if (pcSlice->isNextSliceSegment() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceSegmentMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSliceSegment);
+            startCUAddrSliceSegmentIdx++;
+            pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment );
+        }
+        else
+        {
+            // Hossam: Simple case is often visited for now XXXXX
+            startCUAddrSlice                                                            = pcSlice->getSliceCurEndCUAddr();
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+        }
+        
+        nextCUAddr = (startCUAddrSlice > startCUAddrSliceSegment) ? startCUAddrSlice : startCUAddrSliceSegment;
+        
+    } // end while on nextCU addr uiRealEnd
+    
+  
+    return mean;
+//    return variance;
+
+    
+}
+
+// The method that I'm using---Hossam Amer 21/11/2017 -- Inter dep to calculate sigma squared along with SC
+Bool TEncSceneChange::isSceneChangeInter(UInt POC, TComSlice* pcSlice, TComList<TComPic*>& rcListPic,  TComPic* pcPic)
+{
+    //    if (POC == 0 ) {
+    if (POC == 0) {
+        
+        curr_sigmaSquared = -1;
+        return false;
+    }
+    
+    //    // case 1
+    // It ruins the calculations of the STD
+    //    if (POC == 9) {
+    //        return true;
+    //    }
+    
+    //    if (isSceneChangePOC(POC)) {
+    //        return true;
+    //    }
+    
+    // Make it common for the other case
+#if SC_FROM_RECONS
+    // case 4 ==> Skip for now! --> XXXX We can't do that since we need to build the buffer! Hossam: Scene change
+    //    if (POC % m_pcCfg->getGOPSize() == 0) {
+    //        return false; // skip
+    //    }
+#endif
+    
+    //    // Disable this in case 4
+    //    if (POC >= 9) {
+    //        return false;
+    //    }
+    
+    
+    //    // Case 2
+    //    if (POC == 6) {
+    //        return true;
+    //    }
+    
+    
+    //    if(isSceneChangePOC(POC))
+    //    {
+    //        return true;
+    //    }
+    
+    //    cout << "SEG FAULT INSIDE IS SCENE CHANGE"  << ", " << boolalpha << (pcSlice->getRefPic(REF_PIC_LIST_0, 0)==NULL) << endl;
+    
+#if SC_ENABLE_PRINT
+    cout << "Start of Scene Change Detection Europa Parkkkkkkkkkkkkkk ! :-)" << endl;
+#endif
+    // Get the reference pic
+    
+    /////////////////////////////////////////////////////////////////////////////////////////////////// Compress a slice
+    
+    
+    if (m_pcCfg->getUseASR()) // adaptive search range
+    {
+        m_pcSliceEncoder->setSearchRange(pcSlice);
+    }
+    
+    Bool bGPBcheck=false;
+    
+    
+    /// >>>>>>>> IBBB-lowDelay    <<<<<<<<<
+    // Hossam: Removed case for B-slice check, set the MVD to false now
+    if ( pcSlice->getSliceType() == B_SLICE)
+    {
+        if ( pcSlice->getNumRefIdx(RefPicList( 0 ) ) == pcSlice->getNumRefIdx(RefPicList( 1 ) ) )
+        {
+            bGPBcheck=true;
+            Int i;
+            for ( i=0; i < pcSlice->getNumRefIdx(RefPicList( 1 ) ); i++ )
+            {
+                if ( pcSlice->getRefPOC(RefPicList(1), i) != pcSlice->getRefPOC(RefPicList(0), i) )
+                {
+                    bGPBcheck=false;
+                    break;
+                }
+            }
+        }
+    }
+    if(bGPBcheck)
+    {
+        pcSlice->setMvdL1ZeroFlag(true);
+    }
+    else
+    {
+        pcSlice->setMvdL1ZeroFlag(false);
+    }
+    
+    
+    // true for IBBBB
+    //          cout << "men barra: " << pcSlice->getMvdL1ZeroFlag() << endl;
+    /// >>>>>>>> IBBB-lowDelay    <<<<<<<<<
+    
+    //    pcSlice->setMvdL1ZeroFlag(bGPBcheck); // Hossam: Removed case for B-slice check, set the MVD to false now
+    
+    
+    pcPic->getSlice(pcSlice->getSliceIdx())->setMvdL1ZeroFlag(pcSlice->getMvdL1ZeroFlag());
+    
+    // Hossam Warning:  XXXXXX Removed the part of Rate control
+    
+    UInt uiNumSlices = 1;
+    
+    UInt uiInternalAddress = pcPic->getNumPartInCU()-4;
+    UInt uiExternalAddress = pcPic->getPicSym()->getNumberOfCUsInFrame()-1;
+    UInt uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiWidth = pcSlice->getSPS()->getPicWidthInLumaSamples();
+    UInt uiHeight = pcSlice->getSPS()->getPicHeightInLumaSamples();
+    while(uiPosX>=uiWidth||uiPosY>=uiHeight)
+    {
+        uiInternalAddress--;
+        uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+        uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    }
+    uiInternalAddress++;
+    if(uiInternalAddress==pcPic->getNumPartInCU())
+    {
+        uiInternalAddress = 0;
+        uiExternalAddress++;
+    }
+    UInt uiRealEndAddress = uiExternalAddress*pcPic->getNumPartInCU()+uiInternalAddress;
+    
+    //        cout << " uiRealEndAddress " << uiRealEndAddress <<  endl; // --
+    
+    Int  p, j;
+    UInt uiEncCUAddr;
+    
+    pcPic->getPicSym()->initTiles(pcSlice->getPPS());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    const Int iNumSubstreams = pcSlice->getPPS()->getNumSubstreams();
+    
+    //        cout << "iNumSubstreams: " << iNumSubstreams << endl; // 1 --
+    
+    for(p=0, uiEncCUAddr=0; p<pcPic->getPicSym()->getNumberOfCUsInFrame(); p++, uiEncCUAddr = pcPic->getPicSym()->xCalculateNxtCUAddr(uiEncCUAddr))
+    {
+        
+        //            cout << "iteration p " << p  << ", addr " << uiEncCUAddr << endl; // iterates for every CU in the frame
+        pcPic->getPicSym()->setCUOrderMap(p, uiEncCUAddr);
+        pcPic->getPicSym()->setInverseCUOrderMap(uiEncCUAddr, p);
+    }
+    pcPic->getPicSym()->setCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    pcPic->getPicSym()->setInverseCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    //        Hossam: I don't think this step is necessary for now: XXXX let's see
+    m_pcEncTop->createWPPCoders(iNumSubstreams);
+    //        pcSbacCoders = m_pcEncTop->getSbacCoders();
+    //        pcSubstreamsOut = new TComOutputBitstream[iNumSubstreams];
+    
+    UInt startCUAddrSliceIdx = 0; // used to index "m_uiStoredStartCUAddrForEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSlice    = 0; // used to keep track of current slice's starting CU addr.
+    pcSlice->setSliceCurStartCUAddr( startCUAddrSlice ); // Setting "start CU addr" for current slice
+    m_storedStartCUAddrForEncodingSlice.clear();
+    
+    UInt startCUAddrSliceSegmentIdx = 0; // used to index "m_uiStoredStartCUAddrForEntropyEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSliceSegment    = 0; // used to keep track of current Dependent slice's starting CU addr.
+    pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment ); // Setting "start CU addr" for current Dependent slice
+    
+    m_storedStartCUAddrForEncodingSliceSegment.clear();
+    UInt nextCUAddr = 0;
+    m_storedStartCUAddrForEncodingSlice.push_back (nextCUAddr);
+    startCUAddrSliceIdx++;
+    m_storedStartCUAddrForEncodingSliceSegment.push_back(nextCUAddr);
+    startCUAddrSliceSegmentIdx++;
+    
+    
+    //        Int sz = (Int) (m_storedStartCUAddrForEncodingSlice.size());
+    //        cout << "Size of the strange list: " << sz << endl;
+    
+    Bool isSceneChange = false;
+    
+    // Compress Slice
+    while(nextCUAddr < uiRealEndAddress)
+    {
+        pcSlice->setNextSlice       ( false );
+        pcSlice->setNextSliceSegment( false );
+        assert(pcPic->getNumAllocatedSlice() == startCUAddrSliceIdx);
+        
+        // ==============================Compress slice step==============================
+        //  Slice compression
+        
+#if SC_FROM_RECONS
+        m_pcSliceEncoder->precompressSliceNew(pcPic);
+        m_pcSliceEncoder->compressSliceNew(pcPic);
+#else
+        m_pcSliceEncoder->precompressSliceNewOrg(pcPic);
+        m_pcSliceEncoder->compressSliceNewOrg(pcPic);
+#endif
+        
+#if GEN_RESI_FRAME
+        this->getResiduals(pcPic);
+#endif
+        
+        // Student T distribution
+        // Hossam: Scene change -- Get outliers
+        isSceneChange =  this->getOutliers(pcPic);
+        
+#if GEN_ENERGY
+        this->getEnergy(pcPic);
+#endif
+        
+        //////////// SIGMA SQUARED
+        const ComponentID ch = ComponentID(COMPONENT_Y);
+        TComPicYuv* data = pcPic->getPicYuvResi(); // get the residual frame
+        Pel* pData = data->getAddr(ch);
+        UInt uiStrideSrc = data->getStride(ch);
+        
+        const UInt uiFrameWidth = data->getWidth(ch);
+        const UInt uiFrameHeight = data->getHeight(ch);
+        // loop on the residual frame to obtain variance
+        Double sum = 0;
+        Double sum_sq = 0;
+        for (UInt height = 0 ; height< uiFrameHeight; height++)
+        {
+            for (UInt width = 0; width < uiFrameWidth; width++)
+            {
+                
+                // Sum up the squared values of the difference
+                sum += pData[width]*pData[width];
+                sum_sq += pData[width] * pData[width] * pData[width] * pData[width];
+            }// end inner loop
+            
+            pData += uiStrideSrc;
+        }// end outer loop
+        
+        // mean and variance calculations
+        Double mean = sum / (uiFrameWidth * uiFrameHeight);
+        Double variance = sum_sq /(uiFrameWidth * uiFrameHeight) - mean * mean;
+        curr_sigmaSquared = mean;
+        
+        //////////// SIGMA SQUARED
+        
+        
+        //        cout << "3afreeet " << endl;
+        //            m_pcSliceEncoder->precompressSlice(pcPic);
+        //            m_pcSliceEncoder->compressSlice(pcPic);
+        
+        // Probe to the address
+        Bool bNoBinBitConstraintViolated = (!pcSlice->isNextSlice() && !pcSlice->isNextSliceSegment());
+        if (pcSlice->isNextSlice() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSlice = pcSlice->getSliceCurEndCUAddr();
+            // Reconstruction slice
+            m_storedStartCUAddrForEncodingSlice.push_back(startCUAddrSlice);
+            startCUAddrSliceIdx++;
+            // Dependent slice
+            if (startCUAddrSliceSegmentIdx>0 && m_storedStartCUAddrForEncodingSliceSegment[startCUAddrSliceSegmentIdx-1] != startCUAddrSlice)
+            {
+                m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSlice);
+                startCUAddrSliceSegmentIdx++;
+            }
+            
+            // Hossam: This case is not visited so far! XXXX
+            if (startCUAddrSlice < uiRealEndAddress)
+            {
+                pcPic->allocateNewSlice();
+                
+                // Hossam: This case is not visited so far!
+                //            cout << "compressGOP: I am allocating a new Slice "  << endl;
+                pcPic->setCurrSliceIdx                  ( startCUAddrSliceIdx-1 );
+                m_pcSliceEncoder->setSliceIdx           ( startCUAddrSliceIdx-1 );
+                pcSlice = pcPic->getSlice               ( startCUAddrSliceIdx-1 );
+                pcSlice->copySliceInfo                  ( pcPic->getSlice(0)      );
+                pcSlice->setSliceIdx                    ( startCUAddrSliceIdx-1 );
+                pcSlice->setSliceCurStartCUAddr         ( startCUAddrSlice      );
+                pcSlice->setSliceSegmentCurStartCUAddr  ( startCUAddrSlice      );
+                pcSlice->setSliceBits(0);
+                uiNumSlices ++;
+            }
+        }
+        else if (pcSlice->isNextSliceSegment() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceSegmentMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSliceSegment);
+            startCUAddrSliceSegmentIdx++;
+            pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment );
+        }
+        else
+        {
+            // Hossam: Simple case is often visited for now XXXXX
+            startCUAddrSlice                                                            = pcSlice->getSliceCurEndCUAddr();
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            
+#if SC_ENABLE_PRINT
+            cout << " startCUaddr " << startCUAddrSlice << ", startCUaddrSliceSegmant " << startCUAddrSliceSegment;
+#endif
+        }
+        
+        nextCUAddr = (startCUAddrSlice > startCUAddrSliceSegment) ? startCUAddrSlice : startCUAddrSliceSegment;
+        
+        
+        // 0 and end is 7072
+#if SC_ENABLE_PRINT
+        cout << "nextCUAddr at the end of the loop " << nextCUAddr << ", " << uiRealEndAddress << endl;
+#endif
+    }
+    
+    //    }// end if do it once
+    
+    
+#if SC_ENABLE_PRINT
+    cout << "I'm out of Scene change method " << endl;
+#endif
+    //    cout << "EXIT " << endl;
+    //
+    
+    //    if(pcSlice->getPOC() == 1)
+    //            exit (EXIT_FAILURE);
+    
+    //        cout << "3afreet " << endl;
+    //       if(pcSlice->getPOC() == 2)
+    //       if(pcSlice->getPOC() == 2)
+    //       {
+    //           cout << "I exit in TEnSceneChange" << endl;
+    //           exit (EXIT_FAILURE);
+    //       }
+    
+    
+    //    return pcSlice->getPOC()==11 || pcSlice->getPOC()==17 || pcSlice->getPOC()==25;
+    
+    //    g_uiMaxCUDepth = MAX_CU_DEPTH;
+    
+    //    return isSceneChange(pcSlice->getPOC());
+    
+    
+    //    cout << "EXIT from SCENE CHANGE METHOD" << endl;
+    
+    
+    // HARD CODE
+    //    if(POC== 27)
+    //    {
+    //        return true;
+    //    }
+    
+    return isSceneChange;
+    //    return isSceneChangePOC(pcSlice->getPOC());
+    
+}
+
+
+// The method that I'm using---Hossam Amer 19/05/2016
+Bool TEncSceneChange::isSceneChange(UInt POC, TComSlice* pcSlice, TComList<TComPic*>& rcListPic,  TComPic* pcPic)
+{
+//    if (POC == 0 ) {
+    if (POC == 0) {
+        return false;
+    }
+
+//    // case 1
+    // It ruins the calculations of the STD
+//    if (POC == 9) {
+//        return true;
+//    }
+    
+//    if (isSceneChangePOC(POC)) {
+//        return true;
+//    }
+
+    // Make it common for the other case
+#if SC_FROM_RECONS
+    // case 4 ==> Skip for now! --> XXXX We can't do that since we need to build the buffer! Hossam: Scene change
+//    if (POC % m_pcCfg->getGOPSize() == 0) {
+//        return false; // skip
+//    }
+#endif
+
+//    // Disable this in case 4
+//    if (POC >= 9) {
+//        return false;
+//    }
+    
+
+//    // Case 2
+//    if (POC == 6) {
+//        return true;
+//    }
+    
+    
+//    if(isSceneChangePOC(POC))
+//    {
+//        return true;
+//    }
+    
+    //    cout << "SEG FAULT INSIDE IS SCENE CHANGE"  << ", " << boolalpha << (pcSlice->getRefPic(REF_PIC_LIST_0, 0)==NULL) << endl;
+    
+#if SC_ENABLE_PRINT
+    cout << "Start of Scene Change Detection Europa Parkkkkkkkkkkkkkk ! :-)" << endl;
+#endif
+    // Get the reference pic
+    /*
+     TComPic* rpcPic;
+     TComList<TComPic*>::iterator iterPic = rcListPic.begin();
+     rpcPic = *iterPic;
+     
+     Int iSize = Int( rcListPic.size() );
+     
+     cout << "iSize: " << iSize << endl;
+     
+     for ( Int i = 0; i < iSize; i++ )
+     {
+     TComPic*  pcPicYuvRec  = *(iterPic++);
+     
+     pcPicYuvRec->get
+     cout << "Nan Inside POC: " << pcPicYuvRec->getPOC() << endl;
+     }
+     
+     cout << "POC of the reference: " << rpcPic->getPOC() << endl;
+     */
+    //    pcSlice -> getPic()->getPicYuvOrg();
+    
+    //    TComSlice* pcSliceBackup;
+    //    pcSliceBackup->copySliceInfo(pcSlice);
+    //    cout << "Hello " << endl;
+    
+    //    cout << "Nan Inside POC: " << pcSliceBackup->getPOC() << endl;
+    //
+    //    cout << "Nan Inside Ref Might be POC: " <<  pcSlice->getRefPic(REF_PIC_LIST_0, 0) ->getPOC() << endl;
+    
+    
+    // Hossam: Get the reference Picture -- I think that's not possible coz there might be better
+    // predictors in the last few frames
+    //    TComPic* refPic;
+    //    TComList<TComPic*>::iterator iterPic = rcListPic.begin();
+    //    Int iSize = Int( rcListPic.size() );
+    //
+    //    cout << "iSize: " << iSize << endl;
+    //
+    //    for ( Int i = 0; i < iSize; i++ )
+    //    {
+    //        TComPic* pcPic = *(iterPic++);
+    //
+    //        if(pcPic -> getPOC() == pcSlice->getPOC()-1)
+    //            refPic = pcPic;
+    //
+    //    }
+    
+    
+    
+    
+    //   // Do it once!
+    //    if(pcSlice->getPOC() > 1)
+    //    {
+    
+    /////////////////////////////////////////////////////////////////////////////////////////////////// Compress a slice
+    
+    
+    if (m_pcCfg->getUseASR()) // adaptive search range
+    {
+        m_pcSliceEncoder->setSearchRange(pcSlice);
+    }
+    
+    Bool bGPBcheck=false;
+    
+   
+    /// >>>>>>>> IBBB-lowDelay    <<<<<<<<<
+    // Hossam: Removed case for B-slice check, set the MVD to false now
+    if ( pcSlice->getSliceType() == B_SLICE)
+    {
+        if ( pcSlice->getNumRefIdx(RefPicList( 0 ) ) == pcSlice->getNumRefIdx(RefPicList( 1 ) ) )
+        {
+            bGPBcheck=true;
+            Int i;
+            for ( i=0; i < pcSlice->getNumRefIdx(RefPicList( 1 ) ); i++ )
+            {
+                if ( pcSlice->getRefPOC(RefPicList(1), i) != pcSlice->getRefPOC(RefPicList(0), i) )
+                {
+                    bGPBcheck=false;
+                    break;
+                }
+            }
+        }
+    }
+    if(bGPBcheck)
+    {
+        pcSlice->setMvdL1ZeroFlag(true);
+    }
+    else
+    {
+        pcSlice->setMvdL1ZeroFlag(false);
+    }
+    
+    
+    // true for IBBBB 
+//          cout << "men barra: " << pcSlice->getMvdL1ZeroFlag() << endl;
+    /// >>>>>>>> IBBB-lowDelay    <<<<<<<<<
+    
+//    pcSlice->setMvdL1ZeroFlag(bGPBcheck); // Hossam: Removed case for B-slice check, set the MVD to false now
+    
+    
+    pcPic->getSlice(pcSlice->getSliceIdx())->setMvdL1ZeroFlag(pcSlice->getMvdL1ZeroFlag());
+    
+    // Hossam Warning:  XXXXXX Removed the part of Rate control
+    
+    UInt uiNumSlices = 1;
+    
+    UInt uiInternalAddress = pcPic->getNumPartInCU()-4;
+    UInt uiExternalAddress = pcPic->getPicSym()->getNumberOfCUsInFrame()-1;
+    UInt uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiWidth = pcSlice->getSPS()->getPicWidthInLumaSamples();
+    UInt uiHeight = pcSlice->getSPS()->getPicHeightInLumaSamples();
+    while(uiPosX>=uiWidth||uiPosY>=uiHeight)
+    {
+        uiInternalAddress--;
+        uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+        uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    }
+    uiInternalAddress++;
+    if(uiInternalAddress==pcPic->getNumPartInCU())
+    {
+        uiInternalAddress = 0;
+        uiExternalAddress++;
+    }
+    UInt uiRealEndAddress = uiExternalAddress*pcPic->getNumPartInCU()+uiInternalAddress;
+    
+    //        cout << " uiRealEndAddress " << uiRealEndAddress <<  endl; // --
+    
+    Int  p, j;
+    UInt uiEncCUAddr;
+    
+    pcPic->getPicSym()->initTiles(pcSlice->getPPS());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    const Int iNumSubstreams = pcSlice->getPPS()->getNumSubstreams();
+    
+    //        cout << "iNumSubstreams: " << iNumSubstreams << endl; // 1 --
+    
+    for(p=0, uiEncCUAddr=0; p<pcPic->getPicSym()->getNumberOfCUsInFrame(); p++, uiEncCUAddr = pcPic->getPicSym()->xCalculateNxtCUAddr(uiEncCUAddr))
+    {
+        
+        //            cout << "iteration p " << p  << ", addr " << uiEncCUAddr << endl; // iterates for every CU in the frame
+        pcPic->getPicSym()->setCUOrderMap(p, uiEncCUAddr);
+        pcPic->getPicSym()->setInverseCUOrderMap(uiEncCUAddr, p);
+    }
+    pcPic->getPicSym()->setCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    pcPic->getPicSym()->setInverseCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    //        Hossam: I don't think this step is necessary for now: XXXX let's see
+    m_pcEncTop->createWPPCoders(iNumSubstreams);
+    //        pcSbacCoders = m_pcEncTop->getSbacCoders();
+    //        pcSubstreamsOut = new TComOutputBitstream[iNumSubstreams];
+    
+    UInt startCUAddrSliceIdx = 0; // used to index "m_uiStoredStartCUAddrForEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSlice    = 0; // used to keep track of current slice's starting CU addr.
+    pcSlice->setSliceCurStartCUAddr( startCUAddrSlice ); // Setting "start CU addr" for current slice
+    m_storedStartCUAddrForEncodingSlice.clear();
+    
+    UInt startCUAddrSliceSegmentIdx = 0; // used to index "m_uiStoredStartCUAddrForEntropyEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSliceSegment    = 0; // used to keep track of current Dependent slice's starting CU addr.
+    pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment ); // Setting "start CU addr" for current Dependent slice
+    
+    m_storedStartCUAddrForEncodingSliceSegment.clear();
+    UInt nextCUAddr = 0;
+    m_storedStartCUAddrForEncodingSlice.push_back (nextCUAddr);
+    startCUAddrSliceIdx++;
+    m_storedStartCUAddrForEncodingSliceSegment.push_back(nextCUAddr);
+    startCUAddrSliceSegmentIdx++;
+    
+    
+    //        Int sz = (Int) (m_storedStartCUAddrForEncodingSlice.size());
+    //        cout << "Size of the strange list: " << sz << endl;
+    
+    Bool isSceneChange = false;
+    
+    // Compress Slice
+    while(nextCUAddr < uiRealEndAddress)
+    {
+        pcSlice->setNextSlice       ( false );
+        pcSlice->setNextSliceSegment( false );
+        assert(pcPic->getNumAllocatedSlice() == startCUAddrSliceIdx);
+        
+        // ==============================Compress slice step==============================
+        //  Slice compression
+        
+#if SC_FROM_RECONS
+        m_pcSliceEncoder->precompressSliceNew(pcPic);
+        m_pcSliceEncoder->compressSliceNew(pcPic);
+#else
+        m_pcSliceEncoder->precompressSliceNewOrg(pcPic);
+        m_pcSliceEncoder->compressSliceNewOrg(pcPic);
+#endif
+
+#if GEN_RESI_FRAME
+        this->getResiduals(pcPic);
+#endif
+        
+        // Student T distribution
+        // Hossam: Scene change -- Get outliers
+        isSceneChange =  this->getOutliers(pcPic);
+        
+#if GEN_ENERGY
+        this->getEnergy(pcPic);
+#endif
+        
+//        cout << "3afreeet " << endl;
+        //            m_pcSliceEncoder->precompressSlice(pcPic);
+        //            m_pcSliceEncoder->compressSlice(pcPic);
+        
+        // Probe to the address
+        Bool bNoBinBitConstraintViolated = (!pcSlice->isNextSlice() && !pcSlice->isNextSliceSegment());
+        if (pcSlice->isNextSlice() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSlice = pcSlice->getSliceCurEndCUAddr();
+            // Reconstruction slice
+            m_storedStartCUAddrForEncodingSlice.push_back(startCUAddrSlice);
+            startCUAddrSliceIdx++;
+            // Dependent slice
+            if (startCUAddrSliceSegmentIdx>0 && m_storedStartCUAddrForEncodingSliceSegment[startCUAddrSliceSegmentIdx-1] != startCUAddrSlice)
+            {
+                m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSlice);
+                startCUAddrSliceSegmentIdx++;
+            }
+            
+            // Hossam: This case is not visited so far! XXXX
+            if (startCUAddrSlice < uiRealEndAddress)
+            {
+                pcPic->allocateNewSlice();
+                
+                // Hossam: This case is not visited so far!
+                //            cout << "compressGOP: I am allocating a new Slice "  << endl;
+                pcPic->setCurrSliceIdx                  ( startCUAddrSliceIdx-1 );
+                m_pcSliceEncoder->setSliceIdx           ( startCUAddrSliceIdx-1 );
+                pcSlice = pcPic->getSlice               ( startCUAddrSliceIdx-1 );
+                pcSlice->copySliceInfo                  ( pcPic->getSlice(0)      );
+                pcSlice->setSliceIdx                    ( startCUAddrSliceIdx-1 );
+                pcSlice->setSliceCurStartCUAddr         ( startCUAddrSlice      );
+                pcSlice->setSliceSegmentCurStartCUAddr  ( startCUAddrSlice      );
+                pcSlice->setSliceBits(0);
+                uiNumSlices ++;
+            }
+        }
+        else if (pcSlice->isNextSliceSegment() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceSegmentMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSliceSegment);
+            startCUAddrSliceSegmentIdx++;
+            pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment );
+        }
+        else
+        {
+            // Hossam: Simple case is often visited for now XXXXX
+            startCUAddrSlice                                                            = pcSlice->getSliceCurEndCUAddr();
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            
+#if SC_ENABLE_PRINT
+            cout << " startCUaddr " << startCUAddrSlice << ", startCUaddrSliceSegmant " << startCUAddrSliceSegment;
+#endif
+        }
+        
+        nextCUAddr = (startCUAddrSlice > startCUAddrSliceSegment) ? startCUAddrSlice : startCUAddrSliceSegment;
+        
+        
+        // 0 and end is 7072
+#if SC_ENABLE_PRINT
+        cout << "nextCUAddr at the end of the loop " << nextCUAddr << ", " << uiRealEndAddress << endl;
+#endif
+    }
+    
+    //    }// end if do it once
+    
+    
+#if SC_ENABLE_PRINT
+    cout << "I'm out of Scene change method " << endl;
+#endif
+    //    cout << "EXIT " << endl;
+    //
+    
+    //    if(pcSlice->getPOC() == 1)
+//            exit (EXIT_FAILURE);
+    
+//        cout << "3afreet " << endl;
+//       if(pcSlice->getPOC() == 2)
+//       if(pcSlice->getPOC() == 2)
+//       {
+//           cout << "I exit in TEnSceneChange" << endl;
+//           exit (EXIT_FAILURE);
+//       }
+
+    
+    //    return pcSlice->getPOC()==11 || pcSlice->getPOC()==17 || pcSlice->getPOC()==25;
+    
+    //    g_uiMaxCUDepth = MAX_CU_DEPTH;
+    
+    //    return isSceneChange(pcSlice->getPOC());
+    
+    
+//    cout << "EXIT from SCENE CHANGE METHOD" << endl;
+
+    
+    // HARD CODE
+//    if(POC== 27)
+//    {
+//        return true;
+//    }
+    
+    return isSceneChange;
+//    return isSceneChangePOC(pcSlice->getPOC());
+    
+}
+
+// Hossam: This one is not used (June 13th, 2016)
+Bool TEncSceneChange::isSceneChangeOrg(UInt POC, TComSlice* pcSlice, TComList<TComPic*>& rcListPic,  TComPic* pcPic)
+{
+    if (POC == 0) {
+        return false;
+    }
+    
+    //    // case 1
+    //    if (POC == 9) {
+    //        return true;
+    //    }
+    
+//    if (isSceneChangePOC(POC)) {
+//        return true;
+//    }
+    
+    // case 4 ==> Skip for now! --> XXXX We can't do that since we need to build the buffer! Hossam: Scene change
+//    if (POC % m_pcCfg->getGOPSize() == 0) {
+//        return false; // skip
+//    }
+    
+    //    // Disable this in case 4
+    //    if (POC >= 9) {
+    //        return false;
+    //    }
+    
+    
+    //    // Case 2
+    //    if (POC == 6) {
+    //        return true;
+    //    }
+    
+    
+    //    if(isSceneChangePOC(POC))
+    //    {
+    //        return true;
+    //    }
+    
+    //    cout << "SEG FAULT INSIDE IS SCENE CHANGE"  << ", " << boolalpha << (pcSlice->getRefPic(REF_PIC_LIST_0, 0)==NULL) << endl;
+    
+#if SC_ENABLE_PRINT
+    cout << "Start of Scene Change Detection Europa Parkkkkkkkkkkkkkk ! :-)" << endl;
+#endif
+    // Get the reference pic
+    /*
+     TComPic* rpcPic;
+     TComList<TComPic*>::iterator iterPic = rcListPic.begin();
+     rpcPic = *iterPic;
+     
+     Int iSize = Int( rcListPic.size() );
+     
+     cout << "iSize: " << iSize << endl;
+     
+     for ( Int i = 0; i < iSize; i++ )
+     {
+     TComPic*  pcPicYuvRec  = *(iterPic++);
+     
+     pcPicYuvRec->get
+     cout << "Nan Inside POC: " << pcPicYuvRec->getPOC() << endl;
+     }
+     
+     cout << "POC of the reference: " << rpcPic->getPOC() << endl;
+     */
+    //    pcSlice -> getPic()->getPicYuvOrg();
+    
+    //    TComSlice* pcSliceBackup;
+    //    pcSliceBackup->copySliceInfo(pcSlice);
+    //    cout << "Hello " << endl;
+    
+    //    cout << "Nan Inside POC: " << pcSliceBackup->getPOC() << endl;
+    //
+    //    cout << "Nan Inside Ref Might be POC: " <<  pcSlice->getRefPic(REF_PIC_LIST_0, 0) ->getPOC() << endl;
+    
+    
+    // Hossam: Get the reference Picture -- I think that's not possible coz there might be better
+    // predictors in the last few frames
+    //    TComPic* refPic;
+    //    TComList<TComPic*>::iterator iterPic = rcListPic.begin();
+    //    Int iSize = Int( rcListPic.size() );
+    //
+    //    cout << "iSize: " << iSize << endl;
+    //
+    //    for ( Int i = 0; i < iSize; i++ )
+    //    {
+    //        TComPic* pcPic = *(iterPic++);
+    //
+    //        if(pcPic -> getPOC() == pcSlice->getPOC()-1)
+    //            refPic = pcPic;
+    //
+    //    }
+    
+    
+    
+    
+    //   // Do it once!
+    //    if(pcSlice->getPOC() > 1)
+    //    {
+    
+    /////////////////////////////////////////////////////////////////////////////////////////////////// Compress a slice
+    
+    
+    if (m_pcCfg->getUseASR()) // adaptive search range
+    {
+        m_pcSliceEncoder->setSearchRange(pcSlice);
+    }
+    
+    // Hossam: New change B-slice Ignore
+    Bool bGPBcheck=false;
+    pcSlice->setMvdL1ZeroFlag(bGPBcheck); // Hossam: Removed case for B-slice check, set the MVD to false now
+    
+    
+    pcPic->getSlice(pcSlice->getSliceIdx())->setMvdL1ZeroFlag(pcSlice->getMvdL1ZeroFlag());
+    
+    // Hossam Warning:  XXXXXX Removed the part of Rate control
+    
+    UInt uiNumSlices = 1;
+    
+    UInt uiInternalAddress = pcPic->getNumPartInCU()-4;
+    UInt uiExternalAddress = pcPic->getPicSym()->getNumberOfCUsInFrame()-1;
+    UInt uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiWidth = pcSlice->getSPS()->getPicWidthInLumaSamples();
+    UInt uiHeight = pcSlice->getSPS()->getPicHeightInLumaSamples();
+    while(uiPosX>=uiWidth||uiPosY>=uiHeight)
+    {
+        uiInternalAddress--;
+        uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+        uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    }
+    uiInternalAddress++;
+    if(uiInternalAddress==pcPic->getNumPartInCU())
+    {
+        uiInternalAddress = 0;
+        uiExternalAddress++;
+    }
+    UInt uiRealEndAddress = uiExternalAddress*pcPic->getNumPartInCU()+uiInternalAddress;
+    
+    //        cout << " uiRealEndAddress " << uiRealEndAddress <<  endl; // --
+    
+    Int  p, j;
+    UInt uiEncCUAddr;
+    
+    pcPic->getPicSym()->initTiles(pcSlice->getPPS());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    const Int iNumSubstreams = pcSlice->getPPS()->getNumSubstreams();
+    
+    //        cout << "iNumSubstreams: " << iNumSubstreams << endl; // 1 --
+    
+    for(p=0, uiEncCUAddr=0; p<pcPic->getPicSym()->getNumberOfCUsInFrame(); p++, uiEncCUAddr = pcPic->getPicSym()->xCalculateNxtCUAddr(uiEncCUAddr))
+    {
+        
+        //            cout << "iteration p " << p  << ", addr " << uiEncCUAddr << endl; // iterates for every CU in the frame
+        pcPic->getPicSym()->setCUOrderMap(p, uiEncCUAddr);
+        pcPic->getPicSym()->setInverseCUOrderMap(uiEncCUAddr, p);
+    }
+    pcPic->getPicSym()->setCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    pcPic->getPicSym()->setInverseCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    //        Hossam: I don't think this step is necessary for now: XXXX let's see
+    m_pcEncTop->createWPPCoders(iNumSubstreams);
+    //        pcSbacCoders = m_pcEncTop->getSbacCoders();
+    //        pcSubstreamsOut = new TComOutputBitstream[iNumSubstreams];
+    
+    UInt startCUAddrSliceIdx = 0; // used to index "m_uiStoredStartCUAddrForEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSlice    = 0; // used to keep track of current slice's starting CU addr.
+    pcSlice->setSliceCurStartCUAddr( startCUAddrSlice ); // Setting "start CU addr" for current slice
+    m_storedStartCUAddrForEncodingSlice.clear();
+    
+    UInt startCUAddrSliceSegmentIdx = 0; // used to index "m_uiStoredStartCUAddrForEntropyEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSliceSegment    = 0; // used to keep track of current Dependent slice's starting CU addr.
+    pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment ); // Setting "start CU addr" for current Dependent slice
+    
+    m_storedStartCUAddrForEncodingSliceSegment.clear();
+    UInt nextCUAddr = 0;
+    m_storedStartCUAddrForEncodingSlice.push_back (nextCUAddr);
+    startCUAddrSliceIdx++;
+    m_storedStartCUAddrForEncodingSliceSegment.push_back(nextCUAddr);
+    startCUAddrSliceSegmentIdx++;
+    
+    
+    //        Int sz = (Int) (m_storedStartCUAddrForEncodingSlice.size());
+    //        cout << "Size of the strange list: " << sz << endl;
+    
+    Bool isSceneChange = false;
+    
+    // Compress Slice
+    while(nextCUAddr < uiRealEndAddress)
+    {
+        pcSlice->setNextSlice       ( false );
+        pcSlice->setNextSliceSegment( false );
+        assert(pcPic->getNumAllocatedSlice() == startCUAddrSliceIdx);
+        
+        // ==============================Compress slice step==============================
+        //  Slice compression
+        
+//        m_pcSliceEncoder->precompressSliceNew(pcPic);
+//        m_pcSliceEncoder->compressSliceNew(pcPic);
+        
+        m_pcSliceEncoder->precompressSliceNewOrg(pcPic);
+        m_pcSliceEncoder->compressSliceNewOrg(pcPic);
+        
+        
+//        cout << "MASER MAWTANY" << endl; 
+        // Hossam: Scene change -- Get outliers
+        isSceneChange =  this->getOutliers(pcPic);
+        
+        //            m_pcSliceEncoder->precompressSlice(pcPic);
+        //            m_pcSliceEncoder->compressSlice(pcPic);
+        
+        // Probe to the address
+        Bool bNoBinBitConstraintViolated = (!pcSlice->isNextSlice() && !pcSlice->isNextSliceSegment());
+        if (pcSlice->isNextSlice() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSlice = pcSlice->getSliceCurEndCUAddr();
+            // Reconstruction slice
+            m_storedStartCUAddrForEncodingSlice.push_back(startCUAddrSlice);
+            startCUAddrSliceIdx++;
+            // Dependent slice
+            if (startCUAddrSliceSegmentIdx>0 && m_storedStartCUAddrForEncodingSliceSegment[startCUAddrSliceSegmentIdx-1] != startCUAddrSlice)
+            {
+                m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSlice);
+                startCUAddrSliceSegmentIdx++;
+            }
+            
+            // Hossam: This case is not visited so far! XXXX
+            if (startCUAddrSlice < uiRealEndAddress)
+            {
+                pcPic->allocateNewSlice();
+                
+                // Hossam: This case is not visited so far!
+                //            cout << "compressGOP: I am allocating a new Slice "  << endl;
+                pcPic->setCurrSliceIdx                  ( startCUAddrSliceIdx-1 );
+                m_pcSliceEncoder->setSliceIdx           ( startCUAddrSliceIdx-1 );
+                pcSlice = pcPic->getSlice               ( startCUAddrSliceIdx-1 );
+                pcSlice->copySliceInfo                  ( pcPic->getSlice(0)      );
+                pcSlice->setSliceIdx                    ( startCUAddrSliceIdx-1 );
+                pcSlice->setSliceCurStartCUAddr         ( startCUAddrSlice      );
+                pcSlice->setSliceSegmentCurStartCUAddr  ( startCUAddrSlice      );
+                pcSlice->setSliceBits(0);
+                uiNumSlices ++;
+            }
+        }
+        else if (pcSlice->isNextSliceSegment() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceSegmentMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSliceSegment);
+            startCUAddrSliceSegmentIdx++;
+            pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment );
+        }
+        else
+        {
+            // Hossam: Simple case is often visited for now XXXXX
+            startCUAddrSlice                                                            = pcSlice->getSliceCurEndCUAddr();
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            
+#if SC_ENABLE_PRINT
+            cout << " startCUaddr " << startCUAddrSlice << ", startCUaddrSliceSegmant " << startCUAddrSliceSegment;
+#endif
+        }
+        
+        nextCUAddr = (startCUAddrSlice > startCUAddrSliceSegment) ? startCUAddrSlice : startCUAddrSliceSegment;
+        
+        
+        // 0 and end is 7072
+#if SC_ENABLE_PRINT
+        cout << "nextCUAddr at the end of the loop " << nextCUAddr << ", " << uiRealEndAddress << endl;
+#endif
+    }
+    
+    //    }// end if do it once
+    
+    
+#if SC_ENABLE_PRINT
+    cout << "I'm out of Scene change method " << endl;
+#endif
+    //    cout << "EXIT " << endl;
+    //
+    
+    //    if(pcSlice->getPOC() == 1)
+    //        exit (EXIT_FAILURE);
+    
+    //    return pcSlice->getPOC()==11 || pcSlice->getPOC()==17 || pcSlice->getPOC()==25;
+    
+    //    g_uiMaxCUDepth = MAX_CU_DEPTH;
+    
+    //    return isSceneChange(pcSlice->getPOC());
+    
+    
+//        cout << "EXIT from SCENE CHANGE METHOD" << endl;
+    
+    
+    // HARD CODE
+    //    if(POC== 27)
+    //    {
+    //        return true;
+    //    }
+    
+    return isSceneChange;
+    //    return isSceneChangePOC(pcSlice->getPOC());
+    
+}
+
+
+#if GEN_RESI_FRAME
+Void TEncSceneChange::getResiduals(TComPic *rpcPic)
+{
+    //for(Int chan=0; chan < rpcPic->getNumberValidComponents(); chan++)
+    for(Int chan=0; chan < SC_COMPS_OUTLIERS; chan++) // only for Y component
+    {
+        const ComponentID ch = ComponentID(chan);
+        
+        TComPicYuv* data = rpcPic->getPicYuvResi(); // get the residual frame
+        Pel* pData = data->getAddr(ch);
+        UInt uiStrideSrc = data->getStride(ch);
+        
+        const UInt uiFrameWidth = data->getWidth(ch);
+        const UInt uiFrameHeight = data->getHeight(ch);
+        
+        
+        
+        //        cout << " Emilyyyyyyyyy: w, h, stride src, stride dest: " << uiFrameWidth << ", " << uiFrameHeight << ", "
+        //                << uiStrideSrc << ", " << uiStrideDst << endl;
+        
+        unsigned char *bufOrgTem = new unsigned char[uiFrameWidth];
+        for (UInt height = 0 ; height< uiFrameHeight; height++)
+        {
+            for (UInt width = 0; width < uiFrameWidth; width++)
+            {
+                
+                if (pData[width] < 0) {
+                    pData[width] = -1*pData[width];
+                }
+                else if(pData[width] > 255)
+                {
+                    pData[width] = 255;
+                }
+                
+                bufOrgTem[width] = pData[width];
+            }// end inner loop
+            residualYuvFile.write(reinterpret_cast<char*>(bufOrgTem), uiFrameWidth);
+            pData += uiStrideSrc;
+            
+        }// end for loop
+        
+        
+    }// end for loop
+    
+    
+}// end method
+#endif
+
+Double TEncSceneChange::calculateEnergy(Pel *pData, UInt uiStrideSrc, const UInt uiFrameWidth, const UInt uiFrameHeight)
+{
+    Double energy = 0;
+    for (Int i = 0; i < uiFrameHeight; i++) {
+        for (Int j = 0; j < uiFrameWidth; j++) {
+            
+            energy += pData[j]*pData[j];
+            
+        }// end inner loop
+        
+        pData += uiStrideSrc;
+    }// end outer loop
+    
+    // Normalised Energy
+    return energy/(uiFrameWidth*uiFrameHeight);
+}
+
+static FILE* pFile3 = NULL;
+Bool TEncSceneChange::getEnergy(TComPic *rpcPic)
+{
+    Bool isSceneChange = false;
+    
+    for(Int chan=0; chan < SC_COMPS_OUTLIERS; chan++) // only for Y component
+    {
+        const ComponentID ch = ComponentID(chan);
+        
+        TComPicYuv* data = rpcPic->getPicYuvResi(); // get the residual frame
+        Pel* pData = data->getAddr(ch);
+        UInt uiStrideSrc = data->getStride(ch);
+        
+        const UInt uiFrameWidth  = data->getWidth(ch);
+        const UInt uiFrameHeight = data->getHeight(ch);
+        
+        ///////// Calculate Energy
+        Double energy = calculateEnergy(pData, uiStrideSrc, uiFrameWidth, uiFrameHeight);
+        
+#if GEN_ENERGY
+        
+        pFile3 = fopen ("energyView.txt", "at");
+        
+        fprintf(pFile3, "%d\t\t\t\t %f\t\t\t\t %s \n",
+                rpcPic->getPOC() ,
+                energy,
+                isSceneChange? "true": "false");
+        
+          fclose(pFile3);
+        
+        ////
+        
+        std::ostringstream oss_muExact;
+        oss_muExact << "Gen//Seq-TXT//" << g_input_FileName << "_energy" << g_qpInit  << ".txt";
+        string fileName_muExact = oss_muExact.str();
+        pFile3 = fopen (fileName_muExact.c_str(), "at");
+//        pFile3 = fopen ("energy.txt", "at");
+        fprintf(pFile3, "%f\n",  energy);
+        fclose(pFile3);
+
+#endif
+        
+    }// end for loop
+    
+    
+    return  isSceneChange;
+}
+
+
+
+// Sastre Method 2012 & 2010
+#if IS_SASTRE_SCD
+static UInt k = 1;
+Bool TEncSceneChange::isSceneChangeSastre(UInt POC, TComSlice* pcSlice, TComList<TComPic*>& rcListPic,  TComPic* pcPic)
+{
+    if (POC == 0) {
+        return false;
+    }
+    
+    
+    /////////////////////////////////////////////////////////////////////////////////////////////////// Compress a slice
+    
+    
+    if (m_pcCfg->getUseASR()) // adaptive search range
+    {
+        m_pcSliceEncoder->setSearchRange(pcSlice);
+    }
+    
+    Bool bGPBcheck=false;
+    pcSlice->setMvdL1ZeroFlag(bGPBcheck); // Hossam: Removed case for B-slice check, set the MVD to false now
+    
+    
+    pcPic->getSlice(pcSlice->getSliceIdx())->setMvdL1ZeroFlag(pcSlice->getMvdL1ZeroFlag());
+    
+    // Hossam Warning:  XXXXXX Removed the part of Rate control
+    
+    UInt uiNumSlices = 1;
+    
+    UInt uiInternalAddress = pcPic->getNumPartInCU()-4;
+    UInt uiExternalAddress = pcPic->getPicSym()->getNumberOfCUsInFrame()-1;
+    UInt uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiWidth = pcSlice->getSPS()->getPicWidthInLumaSamples();
+    UInt uiHeight = pcSlice->getSPS()->getPicHeightInLumaSamples();
+    while(uiPosX>=uiWidth||uiPosY>=uiHeight)
+    {
+        uiInternalAddress--;
+        uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+        uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    }
+    uiInternalAddress++;
+    if(uiInternalAddress==pcPic->getNumPartInCU())
+    {
+        uiInternalAddress = 0;
+        uiExternalAddress++;
+    }
+    UInt uiRealEndAddress = uiExternalAddress*pcPic->getNumPartInCU()+uiInternalAddress;
+    
+    //        cout << " uiRealEndAddress " << uiRealEndAddress <<  endl; // --
+    
+    Int  p, j;
+    UInt uiEncCUAddr;
+    
+    pcPic->getPicSym()->initTiles(pcSlice->getPPS());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    const Int iNumSubstreams = pcSlice->getPPS()->getNumSubstreams();
+    
+    //        cout << "iNumSubstreams: " << iNumSubstreams << endl; // 1 --
+    
+    for(p=0, uiEncCUAddr=0; p<pcPic->getPicSym()->getNumberOfCUsInFrame(); p++, uiEncCUAddr = pcPic->getPicSym()->xCalculateNxtCUAddr(uiEncCUAddr))
+    {
+        
+        //            cout << "iteration p " << p  << ", addr " << uiEncCUAddr << endl; // iterates for every CU in the frame
+        pcPic->getPicSym()->setCUOrderMap(p, uiEncCUAddr);
+        pcPic->getPicSym()->setInverseCUOrderMap(uiEncCUAddr, p);
+    }
+    pcPic->getPicSym()->setCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    pcPic->getPicSym()->setInverseCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    //        Hossam: I don't think this step is necessary for now: XXXX let's see
+    m_pcEncTop->createWPPCoders(iNumSubstreams);
+    //        pcSbacCoders = m_pcEncTop->getSbacCoders();
+    //        pcSubstreamsOut = new TComOutputBitstream[iNumSubstreams];
+    
+    UInt startCUAddrSliceIdx = 0; // used to index "m_uiStoredStartCUAddrForEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSlice    = 0; // used to keep track of current slice's starting CU addr.
+    pcSlice->setSliceCurStartCUAddr( startCUAddrSlice ); // Setting "start CU addr" for current slice
+    m_storedStartCUAddrForEncodingSlice.clear();
+    
+    UInt startCUAddrSliceSegmentIdx = 0; // used to index "m_uiStoredStartCUAddrForEntropyEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSliceSegment    = 0; // used to keep track of current Dependent slice's starting CU addr.
+    pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment ); // Setting "start CU addr" for current Dependent slice
+    
+    m_storedStartCUAddrForEncodingSliceSegment.clear();
+    UInt nextCUAddr = 0;
+    m_storedStartCUAddrForEncodingSlice.push_back (nextCUAddr);
+    startCUAddrSliceIdx++;
+    m_storedStartCUAddrForEncodingSliceSegment.push_back(nextCUAddr);
+    startCUAddrSliceSegmentIdx++;
+    
+    
+    //        Int sz = (Int) (m_storedStartCUAddrForEncodingSlice.size());
+    //        cout << "Size of the strange list: " << sz << endl;
+    
+    Bool isSceneChange = false;
+    
+    // Compress Slice
+    while(nextCUAddr < uiRealEndAddress)
+    {
+        pcSlice->setNextSlice       ( false );
+        pcSlice->setNextSliceSegment( false );
+        assert(pcPic->getNumAllocatedSlice() == startCUAddrSliceIdx);
+        
+        // ==============================Compress slice step==============================
+        //  Slice compression from Reconstructed
+        
+        
+        sastre_alpha = 0.25;
+        sastre_S     = 500;
+
+        // Compute m(k)
+        sastre_avg_tillK = sastre_avg_tillK*(1-sastre_alpha) + sastre_intra_count_tillK*sastre_alpha;
+
+        
+        // Compute n
+        sastre_span = m_pcCfg->getFrameRate()*sastre_S/1000.0;
+        
+        // Sastre does multi-pass
+        m_pcSliceEncoder->precompressSlice(pcPic);
+        m_pcSliceEncoder->compressSlice(pcPic);
+        
+        
+        // Sastre get the number of intra modes in the frame - let the Slice encoder does it for you
+        m_pcSliceEncoder->xExtractSliceInfo(pcPic);
+        
+        // Fetch the intra modes - MB(k+1)
+        UInt mb_kPlus1 = pcSlice->intra_modes;
+        
+        // Fetch the total number of CUs
+        UInt nTotal = pcSlice->slice_total_parts;
+//        UInt nTotal = pcPic-> getNumCUsInFrame();;
+        
+        // Compute Ta
+        // Selected 50% for now
+        sastre_Ta   = 0.50*nTotal; // made it ntotal and not Ta
+        
+        // Compute Tf
+        sastre_Tf   = 0.98*nTotal;
+        
+        // Compute Tlim
+        sastre_Tlim = 0.95*nTotal;
+        
+        // Select the threshold
+        Double threshold = (k < sastre_span)? sastre_Tf : min(sastre_avg_tillK + sastre_Ta, sastre_Tlim);
+        
+        // Print sastre variables
+        cout << "k: " << k << ", n: " << sastre_span << endl;
+        cout << "nTotal: " << nTotal << ", current intra: " << mb_kPlus1 << " ratio: " << 1.0*mb_kPlus1/nTotal << endl;
+//
+//        cout << "m(k): " << sastre_avg_tillK << ", Mb(k): " << sastre_intra_count_tillK << endl;
+//        cout << "Tf: " << sastre_Tf << ", Ta: " << sastre_Ta  << ", Tlim: " << sastre_Tlim << endl;
+
+
+        
+        cout << "*******Sastreeeee MB(k+1): " << mb_kPlus1 << ", threshold: " << threshold << endl;
+//        cout << "Tf: " << sastre_Tf  << " n: "  << sastre_span  << ", total num of parts: " << nTotal << endl;
+        
+        // My check:
+//        if(mb_kPlus1 >= threshold || (k > 20 && mb_kPlus1 >= 0.10*nTotal) || (mb_kPlus1 == nTotal))
+        // Scene change check
+//        if(mb_kPlus1 >= threshold)
+        if(mb_kPlus1 >= threshold)
+        {
+            isSceneChange = true;
+            
+            // Reset the clock
+            k = 0;
+            
+            // Reset the variables...
+            sastre_avg_tillK = 0;
+            
+        }
+        
+        // Update the clock
+        k = k + 1;
+        
+        // Update the weighted average! Now, the last encoded frame is (k+1)
+        sastre_intra_count_tillK = mb_kPlus1;
+        
+        // Probe to the address
+        Bool bNoBinBitConstraintViolated = (!pcSlice->isNextSlice() && !pcSlice->isNextSliceSegment());
+        if (pcSlice->isNextSlice() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSlice = pcSlice->getSliceCurEndCUAddr();
+            // Reconstruction slice
+            m_storedStartCUAddrForEncodingSlice.push_back(startCUAddrSlice);
+            startCUAddrSliceIdx++;
+            // Dependent slice
+            if (startCUAddrSliceSegmentIdx>0 && m_storedStartCUAddrForEncodingSliceSegment[startCUAddrSliceSegmentIdx-1] != startCUAddrSlice)
+            {
+                m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSlice);
+                startCUAddrSliceSegmentIdx++;
+            }
+            
+            // Hossam: This case is not visited so far! XXXX
+            if (startCUAddrSlice < uiRealEndAddress)
+            {
+                pcPic->allocateNewSlice();
+                
+                // Hossam: This case is not visited so far!
+                //            cout << "compressGOP: I am allocating a new Slice "  << endl;
+                pcPic->setCurrSliceIdx                  ( startCUAddrSliceIdx-1 );
+                m_pcSliceEncoder->setSliceIdx           ( startCUAddrSliceIdx-1 );
+                pcSlice = pcPic->getSlice               ( startCUAddrSliceIdx-1 );
+                pcSlice->copySliceInfo                  ( pcPic->getSlice(0)      );
+                pcSlice->setSliceIdx                    ( startCUAddrSliceIdx-1 );
+                pcSlice->setSliceCurStartCUAddr         ( startCUAddrSlice      );
+                pcSlice->setSliceSegmentCurStartCUAddr  ( startCUAddrSlice      );
+                pcSlice->setSliceBits(0);
+                uiNumSlices ++;
+            }
+        }
+        else if (pcSlice->isNextSliceSegment() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceSegmentMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSliceSegment);
+            startCUAddrSliceSegmentIdx++;
+            pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment );
+        }
+        else
+        {
+            // Hossam: Simple case is often visited for now XXXXX
+            startCUAddrSlice                                                            = pcSlice->getSliceCurEndCUAddr();
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            
+#if SC_ENABLE_PRINT
+            cout << " startCUaddr " << startCUAddrSlice << ", startCUaddrSliceSegmant " << startCUAddrSliceSegment;
+#endif
+        }
+        
+        nextCUAddr = (startCUAddrSlice > startCUAddrSliceSegment) ? startCUAddrSlice : startCUAddrSliceSegment;
+        
+        
+        // 0 and end is 7072
+#if SC_ENABLE_PRINT
+        cout << "nextCUAddr at the end of the loop " << nextCUAddr << ", " << uiRealEndAddress << endl;
+#endif
+        
+    }
+    
+#if GEN_SASTRE_SCs
+    if (isSceneChange) {
+        string fileName = "";
+        std::ostringstream oss;
+//        oss << "Gen//Seq-SCs//" << g_input_FileName << "_" << "_sastre" << ".txt";
+        
+        oss << "Gen//Seq-SCs//" << g_input_FileName << "_" << "_sastre"  << g_skipInterval << ".txt";
+
+        fileName = oss.str();
+        Char* pYUVFileName = fileName.empty()? NULL: strdup(fileName.c_str());
+        
+        FILE* sastre_pFile = fopen (pYUVFileName, "at");
+//        fprintf(sastre_pFile, "%d\n",    pcSlice->getPOC());
+        
+        fprintf(sastre_pFile, "%d,",    pcSlice->getPOC());
+        fclose(sastre_pFile);
+        
+    }
+#endif
+    
+    
+    return isSceneChange;
+    
+}
+#endif
+
+// Yao Method 2012 & 2010
+#if IS_YAO_SCD
+static UInt t = 1;
+static FILE* yao_pFile = NULL;
+Bool TEncSceneChange::isSceneChangeYao(UInt POC, TComSlice* pcSlice, TComList<TComPic*>& rcListPic,  TComPic* pcPic)
+{
+    if (POC == 0) {
+        return false;
+    }
+    
+    
+    /////////////////////////////////////////////////////////////////////////////////////////////////// Compress a slice
+    
+    
+    if (m_pcCfg->getUseASR()) // adaptive search range
+    {
+        m_pcSliceEncoder->setSearchRange(pcSlice);
+    }
+    
+    Bool bGPBcheck=false;
+    pcSlice->setMvdL1ZeroFlag(bGPBcheck); // Hossam: Removed case for B-slice check, set the MVD to false now
+    
+    
+    pcPic->getSlice(pcSlice->getSliceIdx())->setMvdL1ZeroFlag(pcSlice->getMvdL1ZeroFlag());
+    
+    // Hossam Warning:  XXXXXX Removed the part of Rate control
+    
+    UInt uiNumSlices = 1;
+    
+    UInt uiInternalAddress = pcPic->getNumPartInCU()-4;
+    UInt uiExternalAddress = pcPic->getPicSym()->getNumberOfCUsInFrame()-1;
+    UInt uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiWidth = pcSlice->getSPS()->getPicWidthInLumaSamples();
+    UInt uiHeight = pcSlice->getSPS()->getPicHeightInLumaSamples();
+    while(uiPosX>=uiWidth||uiPosY>=uiHeight)
+    {
+        uiInternalAddress--;
+        uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+        uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    }
+    uiInternalAddress++;
+    if(uiInternalAddress==pcPic->getNumPartInCU())
+    {
+        uiInternalAddress = 0;
+        uiExternalAddress++;
+    }
+    UInt uiRealEndAddress = uiExternalAddress*pcPic->getNumPartInCU()+uiInternalAddress;
+    
+    //        cout << " uiRealEndAddress " << uiRealEndAddress <<  endl; // --
+    
+    Int  p, j;
+    UInt uiEncCUAddr;
+    
+    pcPic->getPicSym()->initTiles(pcSlice->getPPS());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    const Int iNumSubstreams = pcSlice->getPPS()->getNumSubstreams();
+    
+    //        cout << "iNumSubstreams: " << iNumSubstreams << endl; // 1 --
+    
+    for(p=0, uiEncCUAddr=0; p<pcPic->getPicSym()->getNumberOfCUsInFrame(); p++, uiEncCUAddr = pcPic->getPicSym()->xCalculateNxtCUAddr(uiEncCUAddr))
+    {
+        
+        //            cout << "iteration p " << p  << ", addr " << uiEncCUAddr << endl; // iterates for every CU in the frame
+        pcPic->getPicSym()->setCUOrderMap(p, uiEncCUAddr);
+        pcPic->getPicSym()->setInverseCUOrderMap(uiEncCUAddr, p);
+    }
+    pcPic->getPicSym()->setCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    pcPic->getPicSym()->setInverseCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    //        Hossam: I don't think this step is necessary for now: XXXX let's see
+    m_pcEncTop->createWPPCoders(iNumSubstreams);
+    //        pcSbacCoders = m_pcEncTop->getSbacCoders();
+    //        pcSubstreamsOut = new TComOutputBitstream[iNumSubstreams];
+    
+    UInt startCUAddrSliceIdx = 0; // used to index "m_uiStoredStartCUAddrForEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSlice    = 0; // used to keep track of current slice's starting CU addr.
+    pcSlice->setSliceCurStartCUAddr( startCUAddrSlice ); // Setting "start CU addr" for current slice
+    m_storedStartCUAddrForEncodingSlice.clear();
+    
+    UInt startCUAddrSliceSegmentIdx = 0; // used to index "m_uiStoredStartCUAddrForEntropyEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSliceSegment    = 0; // used to keep track of current Dependent slice's starting CU addr.
+    pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment ); // Setting "start CU addr" for current Dependent slice
+    
+    m_storedStartCUAddrForEncodingSliceSegment.clear();
+    UInt nextCUAddr = 0;
+    m_storedStartCUAddrForEncodingSlice.push_back (nextCUAddr);
+    startCUAddrSliceIdx++;
+    m_storedStartCUAddrForEncodingSliceSegment.push_back(nextCUAddr);
+    startCUAddrSliceSegmentIdx++;
+    
+    
+    //        Int sz = (Int) (m_storedStartCUAddrForEncodingSlice.size());
+    //        cout << "Size of the strange list: " << sz << endl;
+    
+    Bool isSceneChange = false;
+    
+    // Compress Slice
+    while(nextCUAddr < uiRealEndAddress)
+    {
+        pcSlice->setNextSlice       ( false );
+        pcSlice->setNextSliceSegment( false );
+        assert(pcPic->getNumAllocatedSlice() == startCUAddrSliceIdx);
+        
+        // ==============================Compress slice step==============================
+        //  Slice compression from Reconstructed
+        
+//#if SC_FROM_RECONS_DING
+//        m_pcSliceEncoder->precompressSliceNew(pcPic);
+//        m_pcSliceEncoder->compressSliceNew(pcPic);
+//#else
+//        m_pcSliceEncoder->precompressSliceNewOrg(pcPic);
+//        m_pcSliceEncoder->compressSliceNewOrg(pcPic);
+//#endif
+        
+        // Yao does multi-pass
+        m_pcSliceEncoder->precompressSlice(pcPic);
+        isSceneChange = m_pcSliceEncoder->compressSliceBench(pcPic);
+
+        
+//        cout << "Width in CUs: " << pcPic-> getFrameWidthInCU() << ", Height: " << pcPic->getFrameHeightInCU() << endl;
+//        cout << "Slice# " << pcSlice->getPOC() << ", Intra Count: " << pcSlice->intra_modes << endl;
+
+
+        
+        // Probe to the address
+        Bool bNoBinBitConstraintViolated = (!pcSlice->isNextSlice() && !pcSlice->isNextSliceSegment());
+        if (pcSlice->isNextSlice() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSlice = pcSlice->getSliceCurEndCUAddr();
+            // Reconstruction slice
+            m_storedStartCUAddrForEncodingSlice.push_back(startCUAddrSlice);
+            startCUAddrSliceIdx++;
+            // Dependent slice
+            if (startCUAddrSliceSegmentIdx>0 && m_storedStartCUAddrForEncodingSliceSegment[startCUAddrSliceSegmentIdx-1] != startCUAddrSlice)
+            {
+                m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSlice);
+                startCUAddrSliceSegmentIdx++;
+            }
+            
+            // Hossam: This case is not visited so far! XXXX
+            if (startCUAddrSlice < uiRealEndAddress)
+            {
+                pcPic->allocateNewSlice();
+                
+                // Hossam: This case is not visited so far!
+                //            cout << "compressGOP: I am allocating a new Slice "  << endl;
+                pcPic->setCurrSliceIdx                  ( startCUAddrSliceIdx-1 );
+                m_pcSliceEncoder->setSliceIdx           ( startCUAddrSliceIdx-1 );
+                pcSlice = pcPic->getSlice               ( startCUAddrSliceIdx-1 );
+                pcSlice->copySliceInfo                  ( pcPic->getSlice(0)      );
+                pcSlice->setSliceIdx                    ( startCUAddrSliceIdx-1 );
+                pcSlice->setSliceCurStartCUAddr         ( startCUAddrSlice      );
+                pcSlice->setSliceSegmentCurStartCUAddr  ( startCUAddrSlice      );
+                pcSlice->setSliceBits(0);
+                uiNumSlices ++;
+            }
+        }
+        else if (pcSlice->isNextSliceSegment() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceSegmentMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSliceSegment);
+            startCUAddrSliceSegmentIdx++;
+            pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment );
+        }
+        else
+        {
+            // Hossam: Simple case is often visited for now XXXXX
+            startCUAddrSlice                                                            = pcSlice->getSliceCurEndCUAddr();
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            
+#if SC_ENABLE_PRINT
+            cout << " startCUaddr " << startCUAddrSlice << ", startCUaddrSliceSegmant " << startCUAddrSliceSegment;
+#endif
+        }
+        
+        nextCUAddr = (startCUAddrSlice > startCUAddrSliceSegment) ? startCUAddrSlice : startCUAddrSliceSegment;
+        
+        
+        // 0 and end is 7072
+#if SC_ENABLE_PRINT
+        cout << "nextCUAddr at the end of the loop " << nextCUAddr << ", " << uiRealEndAddress << endl;
+#endif
+        
+    }
+    
+    if (!isSceneChange) {
+        
+    }
+    
+    //    }// end if do it once
+    
+    
+    //    cout << "EXIT " << endl;
+    //
+    
+    //    if(pcSlice->getPOC() == 1)
+    //            exit (EXIT_FAILURE);
+    
+    //        cout << "3afreet " << endl;
+    //       if(pcSlice->getPOC() == 2)
+    //       if(pcSlice->getPOC() == 2)
+    //       {
+    //           cout << "I exit in TEnSceneChange" << endl;
+    //           exit (EXIT_FAILURE);
+    //       }
+    
+    
+    //    return pcSlice->getPOC()==11 || pcSlice->getPOC()==17 || pcSlice->getPOC()==25;
+    
+    //    g_uiMaxCUDepth = MAX_CU_DEPTH;
+    
+    //    return isSceneChange(pcSlice->getPOC());
+    
+    
+    //    cout << "EXIT from SCENE CHANGE METHOD" << endl;
+  
+
+    
+    
+    return isSceneChange;
+    
+}
+#endif
+
+// Ding Method 2008
+#if IS_DING_SCD
+Bool TEncSceneChange::isSceneChangeDing(UInt POC, TComSlice* pcSlice, TComList<TComPic*>& rcListPic,  TComPic* pcPic)
+{
+    if (POC == 0) {
+        return false;
+    }
+    
+    
+    /////////////////////////////////////////////////////////////////////////////////////////////////// Compress a slice
+    
+    
+    if (m_pcCfg->getUseASR()) // adaptive search range
+    {
+        m_pcSliceEncoder->setSearchRange(pcSlice);
+    }
+    
+    Bool bGPBcheck=false;
+    pcSlice->setMvdL1ZeroFlag(bGPBcheck); // Hossam: Removed case for B-slice check, set the MVD to false now
+    
+    
+    pcPic->getSlice(pcSlice->getSliceIdx())->setMvdL1ZeroFlag(pcSlice->getMvdL1ZeroFlag());
+    
+    // Hossam Warning:  XXXXXX Removed the part of Rate control
+    
+    UInt uiNumSlices = 1;
+    
+    UInt uiInternalAddress = pcPic->getNumPartInCU()-4;
+    UInt uiExternalAddress = pcPic->getPicSym()->getNumberOfCUsInFrame()-1;
+    UInt uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    UInt uiWidth = pcSlice->getSPS()->getPicWidthInLumaSamples();
+    UInt uiHeight = pcSlice->getSPS()->getPicHeightInLumaSamples();
+    while(uiPosX>=uiWidth||uiPosY>=uiHeight)
+    {
+        uiInternalAddress--;
+        uiPosX = ( uiExternalAddress % pcPic->getFrameWidthInCU() ) * g_uiMaxCUWidth+ g_auiRasterToPelX[ g_auiZscanToRaster[uiInternalAddress] ];
+        uiPosY = ( uiExternalAddress / pcPic->getFrameWidthInCU() ) * g_uiMaxCUHeight+ g_auiRasterToPelY[ g_auiZscanToRaster[uiInternalAddress] ];
+    }
+    uiInternalAddress++;
+    if(uiInternalAddress==pcPic->getNumPartInCU())
+    {
+        uiInternalAddress = 0;
+        uiExternalAddress++;
+    }
+    UInt uiRealEndAddress = uiExternalAddress*pcPic->getNumPartInCU()+uiInternalAddress;
+    
+    //        cout << " uiRealEndAddress " << uiRealEndAddress <<  endl; // --
+    
+    Int  p, j;
+    UInt uiEncCUAddr;
+    
+    pcPic->getPicSym()->initTiles(pcSlice->getPPS());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    const Int iNumSubstreams = pcSlice->getPPS()->getNumSubstreams();
+    
+    //        cout << "iNumSubstreams: " << iNumSubstreams << endl; // 1 --
+    
+    for(p=0, uiEncCUAddr=0; p<pcPic->getPicSym()->getNumberOfCUsInFrame(); p++, uiEncCUAddr = pcPic->getPicSym()->xCalculateNxtCUAddr(uiEncCUAddr))
+    {
+        
+        //            cout << "iteration p " << p  << ", addr " << uiEncCUAddr << endl; // iterates for every CU in the frame
+        pcPic->getPicSym()->setCUOrderMap(p, uiEncCUAddr);
+        pcPic->getPicSym()->setInverseCUOrderMap(uiEncCUAddr, p);
+    }
+    pcPic->getPicSym()->setCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    pcPic->getPicSym()->setInverseCUOrderMap(pcPic->getPicSym()->getNumberOfCUsInFrame(), pcPic->getPicSym()->getNumberOfCUsInFrame());
+    
+    // Allocate some coders, now we know how many tiles there are.
+    //        Hossam: I don't think this step is necessary for now: XXXX let's see
+    m_pcEncTop->createWPPCoders(iNumSubstreams);
+    //        pcSbacCoders = m_pcEncTop->getSbacCoders();
+    //        pcSubstreamsOut = new TComOutputBitstream[iNumSubstreams];
+    
+    UInt startCUAddrSliceIdx = 0; // used to index "m_uiStoredStartCUAddrForEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSlice    = 0; // used to keep track of current slice's starting CU addr.
+    pcSlice->setSliceCurStartCUAddr( startCUAddrSlice ); // Setting "start CU addr" for current slice
+    m_storedStartCUAddrForEncodingSlice.clear();
+    
+    UInt startCUAddrSliceSegmentIdx = 0; // used to index "m_uiStoredStartCUAddrForEntropyEncodingSlice" containing locations of slice boundaries
+    UInt startCUAddrSliceSegment    = 0; // used to keep track of current Dependent slice's starting CU addr.
+    pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment ); // Setting "start CU addr" for current Dependent slice
+    
+    m_storedStartCUAddrForEncodingSliceSegment.clear();
+    UInt nextCUAddr = 0;
+    m_storedStartCUAddrForEncodingSlice.push_back (nextCUAddr);
+    startCUAddrSliceIdx++;
+    m_storedStartCUAddrForEncodingSliceSegment.push_back(nextCUAddr);
+    startCUAddrSliceSegmentIdx++;
+    
+    
+    //        Int sz = (Int) (m_storedStartCUAddrForEncodingSlice.size());
+    //        cout << "Size of the strange list: " << sz << endl;
+    
+    Bool isSceneChange = false;
+    
+    // Compress Slice
+    while(nextCUAddr < uiRealEndAddress)
+    {
+        pcSlice->setNextSlice       ( false );
+        pcSlice->setNextSliceSegment( false );
+        assert(pcPic->getNumAllocatedSlice() == startCUAddrSliceIdx);
+        
+        // ==============================Compress slice step==============================
+        //  Slice compression from Reconstructed
+        
+#if SC_FROM_RECONS_DING
+        m_pcSliceEncoder->precompressSliceNew(pcPic);
+        m_pcSliceEncoder->compressSliceNew(pcPic);
+#else
+        m_pcSliceEncoder->precompressSliceNewOrg(pcPic);
+        m_pcSliceEncoder->compressSliceNewOrg(pcPic);
+#endif
+        
+#if GEN_RESI_FRAME
+        this->getResiduals(pcPic);
+#endif
+        
+        // Residual Data
+//        TComPicYuv* data = pcPic->getPicYuvResi(); // get the residual frame
+
+        // Hossam: Scene change -- Get SATD
+        isSceneChange =  this->getSATD(pcPic);
+    
+        
+        // Probe to the address
+        Bool bNoBinBitConstraintViolated = (!pcSlice->isNextSlice() && !pcSlice->isNextSliceSegment());
+        if (pcSlice->isNextSlice() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSlice = pcSlice->getSliceCurEndCUAddr();
+            // Reconstruction slice
+            m_storedStartCUAddrForEncodingSlice.push_back(startCUAddrSlice);
+            startCUAddrSliceIdx++;
+            // Dependent slice
+            if (startCUAddrSliceSegmentIdx>0 && m_storedStartCUAddrForEncodingSliceSegment[startCUAddrSliceSegmentIdx-1] != startCUAddrSlice)
+            {
+                m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSlice);
+                startCUAddrSliceSegmentIdx++;
+            }
+            
+            // Hossam: This case is not visited so far! XXXX
+            if (startCUAddrSlice < uiRealEndAddress)
+            {
+                pcPic->allocateNewSlice();
+                
+                // Hossam: This case is not visited so far!
+                //            cout << "compressGOP: I am allocating a new Slice "  << endl;
+                pcPic->setCurrSliceIdx                  ( startCUAddrSliceIdx-1 );
+                m_pcSliceEncoder->setSliceIdx           ( startCUAddrSliceIdx-1 );
+                pcSlice = pcPic->getSlice               ( startCUAddrSliceIdx-1 );
+                pcSlice->copySliceInfo                  ( pcPic->getSlice(0)      );
+                pcSlice->setSliceIdx                    ( startCUAddrSliceIdx-1 );
+                pcSlice->setSliceCurStartCUAddr         ( startCUAddrSlice      );
+                pcSlice->setSliceSegmentCurStartCUAddr  ( startCUAddrSlice      );
+                pcSlice->setSliceBits(0);
+                uiNumSlices ++;
+            }
+        }
+        else if (pcSlice->isNextSliceSegment() || (bNoBinBitConstraintViolated && m_pcCfg->getSliceSegmentMode()==FIXED_NUMBER_OF_LCU))
+        {
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            m_storedStartCUAddrForEncodingSliceSegment.push_back(startCUAddrSliceSegment);
+            startCUAddrSliceSegmentIdx++;
+            pcSlice->setSliceSegmentCurStartCUAddr( startCUAddrSliceSegment );
+        }
+        else
+        {
+            // Hossam: Simple case is often visited for now XXXXX
+            startCUAddrSlice                                                            = pcSlice->getSliceCurEndCUAddr();
+            startCUAddrSliceSegment                                                     = pcSlice->getSliceSegmentCurEndCUAddr();
+            
+#if SC_ENABLE_PRINT
+            cout << " startCUaddr " << startCUAddrSlice << ", startCUaddrSliceSegmant " << startCUAddrSliceSegment;
+#endif
+        }
+        
+        nextCUAddr = (startCUAddrSlice > startCUAddrSliceSegment) ? startCUAddrSlice : startCUAddrSliceSegment;
+        
+        
+        // 0 and end is 7072
+#if SC_ENABLE_PRINT
+        cout << "nextCUAddr at the end of the loop " << nextCUAddr << ", " << uiRealEndAddress << endl;
+#endif
+    
+    }
+    
+    //    }// end if do it once
+    
+  
+    //    cout << "EXIT " << endl;
+    //
+    
+    //    if(pcSlice->getPOC() == 1)
+    //            exit (EXIT_FAILURE);
+    
+    //        cout << "3afreet " << endl;
+    //       if(pcSlice->getPOC() == 2)
+    //       if(pcSlice->getPOC() == 2)
+    //       {
+    //           cout << "I exit in TEnSceneChange" << endl;
+    //           exit (EXIT_FAILURE);
+    //       }
+    
+    
+    //    return pcSlice->getPOC()==11 || pcSlice->getPOC()==17 || pcSlice->getPOC()==25;
+    
+    //    g_uiMaxCUDepth = MAX_CU_DEPTH;
+    
+    //    return isSceneChange(pcSlice->getPOC());
+    
+    
+    //    cout << "EXIT from SCENE CHANGE METHOD" << endl;
+    
+    return isSceneChange;
+
+}
+#endif
+
+static Double current_satd = 0;
+static Double prev_satd = 0;
+static FILE* ding_pFile = NULL;
+Bool TEncSceneChange::getSATD(TComPic *rpcPic)
+{
+    Bool isSceneChange = false;
+    
+    // Double to avoid integer division
+    const UInt resolution = 4;
+    
+    // Create a char pointer
+    Pel* tempBlock;
+    tempBlock = new Pel [(int)(resolution*resolution)];
+    
+    // First cell
+    Pel* tempBlockHelper = tempBlock;
+    
+    // SATD per frame
+    Double satd = 0;
+    
+    
+    for(Int chan=0; chan < SC_COMPS_OUTLIERS; chan++) // only for Y component
+    {
+        const ComponentID ch = ComponentID(chan);
+        
+        TComPicYuv* data = rpcPic->getPicYuvResi(); // get the residual frame
+        Pel* pData = data->getAddr(ch);
+        
+        
+        UInt uiStrideSrc = data->getStride(ch);
+        const UInt uiFrameWidth = data->getWidth(ch);
+        const UInt uiFrameHeight = data->getHeight(ch);
+        
+//        cout << "Source stride: " << uiStrideSrc << endl;
+//        cout << "Source uiFrameWidth: " << uiFrameWidth << endl;
+//        cout << "Source uiFrameHeight: " << uiFrameHeight << endl;
+//        cout << "Number of ver blocks " << uiFrameHeight/resolution << ", Number of hor blocks: " << uiFrameWidth/resolution << endl;
+//        cout << "Address of pData " << &pData << endl;
+        
+        // Calculate the Satd for every 4x4 block
+        
+        // Blocks in y direction
+        for (UInt height = 0 ; height< uiFrameHeight/resolution; height++)
+        {
+            UInt y_start = resolution*height;
+            
+            // Point to the first cell in the data
+            Pel* pDataHelper = pData;
+            
+//            cout << "Address of pDataHelper " << &pDataHelper << endl;
+            
+            
+            // Blocks in x direction
+            for (UInt width = 0; width < uiFrameWidth/resolution; width++)
+            {
+                UInt x_start = resolution*width;
+                
+                // Fetch the block
+                for (UInt i = 0; i < resolution; i++) {
+                    
+                    UInt row_idx = y_start + i;
+                    pDataHelper  += uiStrideSrc*row_idx;
+                    
+//                    cout << "Diff address of pDataHelper " << (pDataHelper-pData)  << endl;
+                    
+
+                    for (UInt j = 0; j < resolution; j++) {
+                        
+                        UInt col_idx = x_start + j;
+                        tempBlockHelper[j] = pDataHelper[col_idx];
+//                        cout << "row_idx: " << row_idx << ", col_idx: " << col_idx << endl;
+//                        cout << "Inner Diff address of pDataHelper " << (&pDataHelper[col_idx]-pData) << endl;
+                        
+//                         cout << "Current block residual: " << pDataHelper[col_idx] << endl;
+                    }
+                    
+                    // Reset the pDataHelper to its place to move it upwards
+                    pDataHelper = pData;
+                    tempBlockHelper    += resolution;
+                    
+//                    cout << "\n " << endl;
+                }
+                
+                
+                // Reset the tempBlock into it's orignal place
+                tempBlockHelper = tempBlock;
+                
+                // Calculate the satd for this block
+                satd += xCalcHADs4x4(tempBlock, uiStrideSrc, 1);
+                
+//                cout << "Current block satd: " << (xCalcHADs4x4(tempBlock, uiStrideSrc, 1)) << endl;
+//                cout << "Done hor block " << width << endl;
+                
+            }// end inner loop
+            
+            
+//            cout << "Done ver block " << height << endl;
+            
+        }// end for loop
+        
+        
+    }// end for loop
+    
+    // save the previous and current
+    prev_satd   = current_satd;
+    current_satd = satd;
+    Double MRR = 0;
+    if (rpcPic->getPOC() > 1) {
+        MRR = current_satd/prev_satd;
+
+        cout << "*******************" << rpcPic->getPOC() <<  ") MRRRR:  " << MRR  << " scene change: " << (MRR >= 1.7) << ", scene change: " << (MRR >= 2.3)  << endl;
+    }
+
+
+    isSceneChange = (MRR >= 1.7);
+    cout  << "*******************" << rpcPic->getPOC() <<  ") SATDDDD:  " << satd << endl;
+    
+#if GEN_DING_SCs
+    if (isSceneChange) {
+        string fileName = "";
+        std::ostringstream oss;
+//        oss << "Gen//Seq-SCs//" << g_input_FileName << "_"  << rpcPic->getSlice(0)->getSliceQp() << "_ding" << ".txt";
+        
+//        oss << "Gen//Seq-SCs//" << g_input_FileName << "_"  << rpcPic->getSlice(0)->getSliceQp() << "_ding" << g_skipInterval << ".txt";
+        
+        
+        oss << "Gen//Seq-SCs//" << g_input_FileName << "_ding" << g_skipInterval << ".txt";// Everytime it's 22
+
+//        oss << "Gen//Seq-SCs//" << g_input_FileName << "_"  << "_ding" << g_skipInterval << ".txt";
+
+
+        fileName = oss.str();
+        Char* pYUVFileName = fileName.empty()? NULL: strdup(fileName.c_str());
+
+        ding_pFile = fopen (pYUVFileName, "at");
+//        fprintf(ding_pFile, "%d\n",    rpcPic->getPOC());
+        
+        fprintf(ding_pFile, "%d, ",    rpcPic->getPOC());
+        fclose(ding_pFile);
+    
+    }
+#endif
+    
+    return isSceneChange;
+}
+
+
+//Distortion TEncSceneChange::xCalcHADs4x4( Pel *diffOrg, Int iStrideOrg, Int iStep )
+Distortion TEncSceneChange::xCalcHADs4x4( Pel *diff, Int iStrideOrg, Int iStep )
+{
+    Int k;
+    Distortion satd = 0;
+//    TCoeff diff[16], m[16], d[16];
+    TCoeff m[16], d[16];
+
+    
+    assert( iStep == 1 );
+//    for( k = 0; k < 16; k+=4 )
+//    {
+//        diff[k+0] = diffOrg[0];
+//        diff[k+1] = diffOrg[1];
+//        diff[k+2] = diffOrg[2];
+//        diff[k+3] = diffOrg[3];
+//        
+//        diffOrg += iStrideOrg;
+//    }
+    
+    /*===== hadamard transform =====*/
+    m[ 0] = diff[ 0] + diff[12];
+    m[ 1] = diff[ 1] + diff[13];
+    m[ 2] = diff[ 2] + diff[14];
+    m[ 3] = diff[ 3] + diff[15];
+    m[ 4] = diff[ 4] + diff[ 8];
+    m[ 5] = diff[ 5] + diff[ 9];
+    m[ 6] = diff[ 6] + diff[10];
+    m[ 7] = diff[ 7] + diff[11];
+    m[ 8] = diff[ 4] - diff[ 8];
+    m[ 9] = diff[ 5] - diff[ 9];
+    m[10] = diff[ 6] - diff[10];
+    m[11] = diff[ 7] - diff[11];
+    m[12] = diff[ 0] - diff[12];
+    m[13] = diff[ 1] - diff[13];
+    m[14] = diff[ 2] - diff[14];
+    m[15] = diff[ 3] - diff[15];
+    
+    d[ 0] = m[ 0] + m[ 4];
+    d[ 1] = m[ 1] + m[ 5];
+    d[ 2] = m[ 2] + m[ 6];
+    d[ 3] = m[ 3] + m[ 7];
+    d[ 4] = m[ 8] + m[12];
+    d[ 5] = m[ 9] + m[13];
+    d[ 6] = m[10] + m[14];
+    d[ 7] = m[11] + m[15];
+    d[ 8] = m[ 0] - m[ 4];
+    d[ 9] = m[ 1] - m[ 5];
+    d[10] = m[ 2] - m[ 6];
+    d[11] = m[ 3] - m[ 7];
+    d[12] = m[12] - m[ 8];
+    d[13] = m[13] - m[ 9];
+    d[14] = m[14] - m[10];
+    d[15] = m[15] - m[11];
+    
+    m[ 0] = d[ 0] + d[ 3];
+    m[ 1] = d[ 1] + d[ 2];
+    m[ 2] = d[ 1] - d[ 2];
+    m[ 3] = d[ 0] - d[ 3];
+    m[ 4] = d[ 4] + d[ 7];
+    m[ 5] = d[ 5] + d[ 6];
+    m[ 6] = d[ 5] - d[ 6];
+    m[ 7] = d[ 4] - d[ 7];
+    m[ 8] = d[ 8] + d[11];
+    m[ 9] = d[ 9] + d[10];
+    m[10] = d[ 9] - d[10];
+    m[11] = d[ 8] - d[11];
+    m[12] = d[12] + d[15];
+    m[13] = d[13] + d[14];
+    m[14] = d[13] - d[14];
+    m[15] = d[12] - d[15];
+    
+    d[ 0] = m[ 0] + m[ 1];
+    d[ 1] = m[ 0] - m[ 1];
+    d[ 2] = m[ 2] + m[ 3];
+    d[ 3] = m[ 3] - m[ 2];
+    d[ 4] = m[ 4] + m[ 5];
+    d[ 5] = m[ 4] - m[ 5];
+    d[ 6] = m[ 6] + m[ 7];
+    d[ 7] = m[ 7] - m[ 6];
+    d[ 8] = m[ 8] + m[ 9];
+    d[ 9] = m[ 8] - m[ 9];
+    d[10] = m[10] + m[11];
+    d[11] = m[11] - m[10];
+    d[12] = m[12] + m[13];
+    d[13] = m[12] - m[13];
+    d[14] = m[14] + m[15];
+    d[15] = m[15] - m[14];
+    
+    for (k=0; k<16; ++k)
+    {
+        satd += abs(d[k]);
+    }
+    satd = ((satd+1)>>1);
+    
+    return satd;
+}
+
+
+#if GEN_TCM_PARAMS
+static Double cur_mean, cur_std, threshold = 0;
+static FILE* pFile = NULL;
+static FILE* pFile2 = NULL;
+#endif
+
+
+
+#if GEN_TCM_PARAMS
+static Double t_current_score = 0;
+#endif
+
+//Void TEncSceneChange::getOutliers(TComPic *rpcPic)
+Bool TEncSceneChange::getOutliers(TComPic *rpcPic)
+{
+    Bool isSceneChange = false;
+    
+#if GEN_OUTLIER
+    getOutlierWithDCT(rpcPic);
+#endif
+    
+    //for(Int chan=0; chan < rpcPic->getNumberValidComponents(); chan++)
+    for(Int chan=0; chan < SC_COMPS_OUTLIERS; chan++) // only for Y component
+    {
+        const ComponentID ch = ComponentID(chan);
+        
+        
+        //        TComPicYuv* data = rpcPic->getPicYuvOrg();
+        TComPicYuv* data = rpcPic->getPicYuvResi(); // get the residual frame
+        TComPicYuv* dataDst = rpcPic->getPicYuvOutlier();
+        
+        Pel* pData = data->getAddr(ch);
+        Pel* pDst = dataDst->getAddr(ch);
+        
+        UInt uiStrideDst = dataDst->getStride(ch);
+        UInt uiStrideSrc = data->getStride(ch);
+        
+        const UInt uiFrameWidth = data->getWidth(ch);
+        const UInt uiFrameHeight = data->getHeight(ch);
+        
+        //set start frequency for TCM
+        Int StartFreq = 1;
+        
+        //perform TCM and get outlier Yc
+        Int peak; double prob, lambda;
+        double Yc;
+        
+        //        UInt sampleSize = rpcPic->getPicYuvResi()->getWidth(ch)*rpcPic->getPicYuvResi()->getHeight(ch);
+        UInt sampleSize = uiFrameWidth*uiFrameHeight;
+        
+
+#if IS_STUDENT_SCD
+        // Perform LPTCM
+        TCMprocessOneSequence(pData, sampleSize, &peak, &prob, &lambda, &Yc );
+#else
+        // Calculate the energy
+        Yc = calculateEnergy(pData, uiStrideSrc, uiFrameWidth, uiFrameHeight);
+
+    #if WRITE_MY_ENERGY
+        std::ostringstream oss_muExact;
+        oss_muExact << "Gen//Seq-TXT//" << g_input_FileName << "_energy" << g_qpInit  << ".txt";
+        string fileName_muExact = oss_muExact.str();
+        FILE* pFile3 = fopen (fileName_muExact.c_str(), "at");
+        fprintf(pFile3, "%f\n",  Yc);
+        fclose(pFile3);
+        
+    #endif
+#endif
+        
+
+#if GEN_TCM_PARAMS
+        // Write the data into file
+        double outliersPercentage = countOutliers(data, Yc)/ sampleSize;
+#endif
+        
+        
+#if GEN_TCM_PARAMS
+        pFile = fopen ("outliers.txt", "at");
+        pFile2 = fopen ("thresholds.txt", "at");
+#endif
+
+        
+//        cout << "Current yc: " << Yc << endl;
+        
+        
+        // Hossam: Save the current_Yc for the current frame
+        m_iCurrentYc = Yc;
+
+#if IS_STUDENT_SCD
+         isSceneChange = isSceneChangeStudentT(Yc, rpcPic->getPOC());
+#elif IS_STUDENT_Energy_SCD
+         isSceneChange = isSceneChangeStudentTEnergy(Yc, rpcPic->getPOC());
+#else
+// Check isSceneChange
+#if !SC_RESET_MEAN_STD
+        isSceneChange = isSceneChangeStd(Yc, rpcPic->getPOC());
+#else
+        isSceneChange = isSceneChangeStdReset(Yc, rpcPic->getPOC());
+#endif
+        
+#endif
+
+#if SC_ENABLE_PRINT_TWO
+        cout << rpcPic->getPOC() << ") Current yc: " << Yc  << ", " << isSceneChange << endl;
+#endif
+
+#if IS_STUDENT_SCD
+#if GEN_TCM_PARAMS
+        fprintf(pFile, "%d\t\t\t\t %f\t\t\t\t %f\t\t\t\t %d\t\t\t\t %f\t\t\t\t %f \t\t\t\t %s \n",
+                rpcPic->getPOC() ,
+                Yc,
+                lambda,
+                peak,
+                prob,
+                outliersPercentage,
+                isSceneChange? "true": "false");
+        
+        
+        fprintf(pFile2, "%d\t\t\t\t %f\t\t\t\t %f\t\t\t\t %s \t\t\t\t %f \t\t\t\t %f \t\t\t\t %f \n",
+                rpcPic->getPOC() ,
+                Yc,
+                t_current_score,
+                isSceneChange? "true": "false",
+                cur_mean, cur_std, threshold);
+        
+        
+        fclose(pFile);          fclose(pFile2);
+#endif
+
+#else
+        
+        
+#if GEN_TCM_PARAMS
+        fprintf(pFile, "%d\t\t\t\t %f\t\t\t\t %f\t\t\t\t %d\t\t\t\t %f\t\t\t\t %f \t\t\t\t %s \n",
+                rpcPic->getPOC() ,
+                Yc,
+                lambda,
+                peak,
+                prob,
+                outliersPercentage,
+                isSceneChange? "true": "false");
+      
+//        fprintf(pFile, "%d\t\t\t\t %f\t\t\t\t %f\t\t\t\t %d\t\t\t\t %f\t\t\t\t %f \t\t\t\t %s \t\t\t\t %f \t\t\t\t %f \t\t\t\t %f \n",
+//                rpcPic->getPOC() ,
+//                Yc,
+//                lambda,
+//                peak,
+//                prob,
+//                outliersPercentage,
+//                isSceneChange? "true": "false",
+//                cur_mean, cur_std, threshold);
+        
+        fprintf(pFile2, "%d\t\t\t\t %f\t\t\t\t %s \t\t\t\t %f \t\t\t\t %f \t\t\t\t %f \n",
+                rpcPic->getPOC() ,
+                Yc,
+                isSceneChange? "true": "false",
+                cur_mean, cur_std, threshold);
+
+        
+        fclose(pFile);          fclose(pFile2);
+#endif
+
+#endif
+        
+        //        cout<<" (Outliers count:  " << countOutliers(data, Yc) << ", W: " << uiFrameWidth << ", H: " << uiFrameHeight << ", sample: " << sampleSize << endl;
+        
+        //        cout<<" (Outliers count:  " << countOutliers(data, Yc) << endl;
+        // Yc = 12, Peak = 149
+        //            cout<<" (Yc:  " << Yc <<" , "<<peak<<" ) \n" << endl;
+        
+        //        TCMprocessOneSequence(CoeffFrequency[x], NumCoefInOneFreq, &peak, &prob, &lambda, &Yc );
+        
+        
+        //        fprintf(pFile, " Stride %d\t\n",
+        //                data->getStride(ch));
+        //
+    }// end for loop
+    
+    
+    
+    //    TComPicYuv* data = rpcPic->getPicYuvResi(); // get the residual frame
+    //    Pel* pData = data->getAddr(COMPONENT_Y);
+    //
+    //    Pel max = getMax(pData, data->getWidth(COMPONENT_Y), data->getHeight(COMPONENT_Y));
+    // 149
+    //    cout << "Max: " << max << endl;
+    
+    
+    //    return isSceneChange;
+    
+//    return rpcPic->getPOC() == 9;
+    
+
+#if GEN_MY_SCs
+    if (isSceneChange) {
+        string fileName = "";
+        std::ostringstream oss;
+        // Unified:
+//        oss << "Gen//Seq-SCs//" << g_input_FileName << "_"  << rpcPic->getSlice(0)->getSliceQp() << ".txt";
+        // Not unified:
+        oss << "Gen//Seq-SCs//" << g_input_FileName << "_"  << g_qpInit << ".txt";
+        
+//        oss << "Gen//Seq-SCs//" << g_input_FileName << "_"  << g_skipInterval << ".txt";
+
+        fileName = oss.str();
+        Char* pYUVFileName = fileName.empty()? NULL: strdup(fileName.c_str());
+        
+        ding_pFile = fopen (pYUVFileName, "at");
+//        fprintf(ding_pFile, "%d\n",    rpcPic->getPOC());
+                fprintf(ding_pFile, "%d,",    rpcPic->getPOC());
+        fclose(ding_pFile);
+        
+    }
+#endif
+    
+    return isSceneChange;
+    
+}// end getOutliers
+
+
+// Student T
+Bool TEncSceneChange::isSceneChangeStudentT(Double current_yc, UInt current_poc)
+{
+
+    // sum up the Yc
+    sumYc = sumYc + current_yc;
+    
+    // add the element to the vector
+    ycArray.push_back(current_yc);
+    
+    // get current mean
+    Double current_mean = getCurrentMean();
+    
+    // Df = 40, const = 6
+    //    Double t_threshold      = 6.315789473524457;
+    // <6, 35>
+    //    Double t_threshold        = 6.363636363530561;
+    
+    //    tTable(6,21)
+    //    6.631578947356154
+    
+    // <6, 26> --> Updated July 11th (21-26 is the same)
+    //    Double t_threshold        = 6.499999999989406;
+    
+    
+    // tTable(6, 78) --> Try July 20
+    // 6.157894737284936
+//    Double t_threshold        = 6.157894737284936;
+    
+    // <6, 26> --> Updated July 11th (21-26 is the same)
+//    Double t_threshold        = 6.499999999989406;
+    
+    // Hossam: trying to update: March 6, 2018
+    // <6, 24>
+    Double t_threshold = 6.545454545407036;
+    
+    // number of T skip
+    UInt numberofTSkip = 6;
+    
+    
+#if SC_SLOW_STD
+    Double current_std = getCurrentStd(current_mean);
+#else
+    Double current_std = getCurrentStdFast(current_mean);
+#endif
+    
+    //    cout << "current_std done " << endl;
+    //    if(Yc(i) > current_mean + 4*current_std && Yc(i) > Yc(i-1) && i > lastSc + sc_duration)
+    
+    
+    
+    
+    //    cout << "\n\nisSceneChange STD: " << current_poc << endl;
+    
+    
+#if GEN_TCM_PARAMS
+    cur_mean    = current_mean;
+    cur_std = current_std;
+    threshold   = t_threshold;
+#endif
+    
+    
+    UInt  numSamplesRecorded =  current_poc - m_iLastSC + 1;
+    if (m_iLastSC == -1) {
+        numSamplesRecorded =  current_poc + 1;
+    }
+    
+    
+    if (numSamplesRecorded >= numberofTSkip) {
+        
+        if (current_std == 0) {
+            return false;
+        }
+        
+        // Get the current t score
+        long lastIndex = ycArray.size()-1;
+        Double t_current =  (ycArray.at(lastIndex) - current_mean) / current_std;
+        
+#if GEN_TCM_PARAMS
+        t_current_score = t_current;
+#endif
+        
+        
+        cout << current_poc << ") Current t-score: " << t_current << ", t_threshold: " << t_threshold << endl;
+        
+        // Assuming that I will always use fast variance
+        Double prev_std = sqrt(prev_variance);
+        
+        ///
+        //        Calculate the mean of the numSamplesRecorder of 4 frames
+        Double sJ = 1;
+        Double s  = ycArray.at(lastIndex-sJ) + ycArray.at(lastIndex-sJ-1) + ycArray.at(lastIndex-sJ-2) + ycArray.at(lastIndex-sJ-3);
+        sJ = sJ + 3;
+        Double mean4 = s/sJ;
+        ///
+        
+        
+        //     Hossam: This one produces really good results in the recall and percision == R = 93, P = 98
+        //   if ( (current_yc > mean6 + 20) ||  (numSamplesRecorded < 65 && current_yc > ycArray.at(lastIndex-1) + 20) ||
+        //            (t_current >= t_threshold && current_yc > ycArray.at(lastIndex-1) + 5)
+        
+        // The last one -- July 25
+        //        if ( (current_yc > mean6 + 15) ||  (numSamplesRecorded < 65 && current_yc > ycArray.at(lastIndex-1) + 20) ||
+        //            (t_current >= t_threshold && current_yc > mean6 + 10)
+        
+        //  % Check for standard sequences
+        Double y1 = 30;
+        Double y2 = 20;
+        
+        //    % Check for YouTube sequences
+//        Double y1 = 15;
+//        Double y2 = 10;
+        if(isYouTubeSequence())
+        {
+            y1 = 15;
+            y2 = 10;
+        }
+        
+        if ( (current_yc > mean4 + y1) ||  (t_current >= t_threshold && current_yc > mean4 + y2)) {
+            
+            // Save Yc for SC
+            m_iLastYcSC = current_yc;
+            
+            // reset the sum
+            sumYc = 0;
+            
+            // clear the vector
+            ycArray.clear();
+            
+#if !SC_SLOW_STD
+            prev_variance = 0;
+#endif
+            return true;
+            
+        }
+        
+    }
+    
+    return false;
+    
+}// end isSceneChangeStudentT
+
+
+// Student T
+Bool TEncSceneChange::isSceneChangeStudentTEnergy(Double current_energy, UInt current_poc)
+{
+    // sum up the Energy
+    sumYc = sumYc + current_energy;
+    
+    // add the element to the vector
+    ycArray.push_back(current_energy);
+    
+    // get current mean
+    Double current_mean = getCurrentMean();
+    
+    // <constant, df>
+    // <6, 74>
+//    Double t_threshold        =   6.166666666126614;
+    
+    // Trying to update: March 6, 2018
+    // <constant, df>
+    // <6, 74>
+    Double t_threshold = 6.166666666126614;
+    
+    // number of T skip
+    UInt numberofTSkip = 6;
+    
+    
+#if SC_SLOW_STD
+    Double current_std = getCurrentStd(current_mean);
+#else
+    Double current_std = getCurrentStdFast(current_mean);
+#endif
+    
+    //    cout << "current_std done " << endl;
+    //    if(Yc(i) > current_mean + 4*current_std && Yc(i) > Yc(i-1) && i > lastSc + sc_duration)
+    
+    
+    
+    
+    //    cout << "\n\nisSceneChange STD: " << current_poc << endl;
+    
+    
+#if GEN_TCM_PARAMS
+    cur_mean    = current_mean;
+    cur_std = current_std;
+    threshold   = t_threshold;
+#endif
+    
+    
+    UInt  numSamplesRecorded =  current_poc - m_iLastSC + 1;
+    if (m_iLastSC == -1) {
+        numSamplesRecorded =  current_poc + 1;
+    }
+    
+    
+    if (numSamplesRecorded >= numberofTSkip) {
+        
+        if (current_std == 0) {
+            return false;
+        }
+        
+        // Get the current t score
+        long lastIndex = ycArray.size()-1;
+        Double t_current =  (ycArray.at(lastIndex) - current_mean) / current_std;
+        
+#if GEN_TCM_PARAMS
+        t_current_score = t_current;
+#endif
+        
+        
+        cout << current_poc << ") Current t-score: " << t_current << ", t_threshold: " << t_threshold << endl;
+        
+        ///
+        //        Calculate the mean of the numSamplesRecorder of 4 frames
+        Double sJ = 1;
+        Double s  = ycArray.at(lastIndex-sJ) + ycArray.at(lastIndex-sJ-1) + ycArray.at(lastIndex-sJ-2) + ycArray.at(lastIndex-sJ-3);
+        sJ = sJ + 3;
+        Double mean4 = s/sJ;
+        
+        
+        
+        
+        //     Hossam: This one produces really good results in the recall and percision == R = 93, P = 98
+        //   if ( (current_yc > mean6 + 20) ||  (numSamplesRecorded < 65 && current_yc > ycArray.at(lastIndex-1) + 20) ||
+        //            (t_current >= t_threshold && current_yc > ycArray.at(lastIndex-1) + 5)
+        
+        // The last one -- July 25
+        //        if ( (current_yc > mean6 + 15) ||  (numSamplesRecorded < 65 && current_yc > ycArray.at(lastIndex-1) + 20) ||
+        //            (t_current >= t_threshold && current_yc > mean6 + 10)
+        
+        //  % Check for standard sequences
+        Double y1 = 400;
+        Double y2 = 40;
+        
+        //    % Check for YouTube sequences
+        if(isYouTubeSequence())
+        {
+           y1 = 100;
+           y2 = 20;
+            
+//            cout << " \n I AM AM YOTUUBEEEEE YOUTUBE GHADA " << endl;
+        }
+//        else
+//        {
+//         cout << " \n I AM AM a TEDDY BAR " << endl;
+//        }
+        
+        if ( (current_energy > mean4 + y1) ||  (t_current >= t_threshold && current_energy > mean4 + y2)) {
+//        if (current_energy > mean4 + t_current >= t_threshold && current_energy > ycArray.at(lastIndex-1) + SC_THRESHOLD_OFFSET_ENERGY) {
+//        if (t_current >= t_threshold && current_energy > ycArray.at(lastIndex-1) + SC_THRESHOLD_OFFSET_ENERGY) {
+        
+            // Save Yc for SC
+            m_iLastYcSC = current_energy;
+            
+            // reset the sum
+            sumYc = 0;
+            
+            // clear the vector
+            ycArray.clear();
+            
+#if !SC_SLOW_STD
+            prev_variance = 0;
+#endif
+            return true;
+            
+        }
+        
+    }
+    
+    return false;
+    
+}// end isSceneChangeStudentTEnergy
+
+// Returns true if the input sequence is YouTube, false otherwise
+Bool TEncSceneChange::isYouTubeSequence()
+{
+
+//    return g_input_FileName.compare("killBillML") || g_input_FileName.compare("hero") ||
+//           g_input_FileName.compare("passion") || g_input_FileName.compare("pulpML") ||
+//           g_input_FileName.compare("two") || g_input_FileName.compare("king") ||
+//           g_input_FileName.compare("final") || g_input_FileName.compare("pirates");
+    
+   // if s2 is a subset of the inputfile name
+   return g_input_FileName.find("king")       != std::string::npos ||
+          g_input_FileName.find("two")        != std::string::npos ||
+          g_input_FileName.find("final")      != std::string::npos ||
+          g_input_FileName.find("hero")       != std::string::npos ||
+          g_input_FileName.find("passion")    != std::string::npos ||
+          g_input_FileName.find("pirates")    != std::string::npos ||
+          g_input_FileName.find("killBillML") != std::string::npos ||
+          g_input_FileName.find("pulp")       != std::string::npos;
+}
+
+
+Bool TEncSceneChange::isSceneChangeStd(Double current_yc, UInt current_poc)
+{
+    // isScene change given the new Yci
+    
+    // sum up the Yc
+    sumYc = sumYc + current_yc;
+    
+    // add the element to the vector
+    ycArray.push_back(current_yc);
+    
+    // get current mean
+    Double current_mean = getCurrentMean();
+    
+    
+    //    cout << "current_mean done " << endl;
+    // get current std
+#if SC_SLOW_STD
+    Double current_std = getCurrentStd(current_mean);
+#else
+    Double current_std = getCurrentStdFast(current_mean);
+#endif
+    
+    
+    //    cout << "current_std done " << endl;
+    //    if(Yc(i) > current_mean + 4*current_std && Yc(i) > Yc(i-1) && i > lastSc + sc_duration)
+    
+    long lastIndex = ycArray.size()-1;
+    
+    //        long lastIndex = current_poc;
+    
+    static Double const factor = 5;
+//      static Double const factor = 2;
+    
+//    cout << "\n\nisSceneChange STD: " << current_poc << endl;
+
+
+#if GEN_TCM_PARAMS
+    cur_mean    = current_mean;
+    cur_std = current_std;
+    threshold   = current_mean + factor*current_std;
+#endif
+    
+       // tweak it --> lastSC
+    if (ycArray.size() >= 2) {
+        
+        
+        //        if (current_yc > current_mean + 4*current_std && ycArray.at(lastIndex) > ycArray.at(lastIndex-1)
+        //            && current_poc > m_iLastSC + SC_DURATION) {
+        if (current_yc > current_mean + factor*current_std && ycArray.at(lastIndex) > ycArray.at(lastIndex-1) + SC_THRESHOLD_OFFSET
+            && current_poc > m_iLastSC + SC_DURATION) {
+            
+            // Save Yc for SC
+            m_iLastYcSC = current_yc;
+
+//            cout << "isSceneChange STD Bus error # 1: " << current_poc << endl;
+            // pop the spike + decrease the sum
+            sumYc -= current_yc;
+            
+            ycArray.pop_back();
+            
+#if !SC_SLOW_STD
+    prev_variance = pow(getCurrentStd(getCurrentMean()), 2);
+#endif
+            
+            return true;
+        }
+    }
+    else
+    {
+//        if (current_yc > current_mean + factor*current_std
+//            && current_poc > m_iLastSC + SC_DURATION) {
+        
+        if (current_yc > current_mean + factor*current_std
+            && current_poc > m_iLastSC + SC_DURATION
+            && current_yc > ycArray.at(lastIndex-1) + SC_THRESHOLD_OFFSET) {
+
+        
+            
+            // Save Yc for SC
+            m_iLastYcSC = current_yc;
+
+            
+//            cout << "isSceneChange STD Bus error # 2: " << current_poc << endl;
+            // pop the spike + decrease the sum
+            sumYc -= current_yc;
+            ycArray.pop_back();
+
+#if !SC_SLOW_STD
+     prev_variance = pow(getCurrentStd(getCurrentMean()), 2);
+#endif
+            
+            return true;
+        }
+    }
+    
+    
+    return false;
+}
+
+Bool TEncSceneChange::isSceneChangeStdReset(Double current_yc, UInt current_poc)
+{
+    // isScene change given the new Yci
+    
+    // sum up the Yc
+    sumYc = sumYc + current_yc;
+    
+    // add the element to the vector
+    ycArray.push_back(current_yc);
+    
+    // get current mean
+    Double current_mean = getCurrentMean();
+
+    //    cout << "current_mean done " << endl;
+    // get current std
+    
+
+#if SC_SLOW_STD
+    Double current_std = getCurrentStd(current_mean);
+#else
+    Double current_std = getCurrentStdFast(current_mean);
+#endif
+    
+    //    cout << "current_std done " << endl;
+    //    if(Yc(i) > current_mean + 4*current_std && Yc(i) > Yc(i-1) && i > lastSc + sc_duration)
+    
+    long lastIndex = ycArray.size()-1;
+    
+    //        long lastIndex = current_poc;
+    
+    static Double const factor = 5;
+    //      static Double const factor = 2;
+    
+    //    cout << "\n\nisSceneChange STD: " << current_poc << endl;
+    
+    
+#if GEN_TCM_PARAMS
+    cur_mean    = current_mean;
+    cur_std = current_std;
+    threshold   = current_mean + factor*current_std;
+#endif
+    
+    // tweak it --> lastSC
+    if (ycArray.size() >= 2) {
+        
+        
+        //        if (current_yc > current_mean + 4*current_std && ycArray.at(lastIndex) > ycArray.at(lastIndex-1)
+        //            && current_poc > m_iLastSC + SC_DURATION) {
+        if (current_yc > current_mean + factor*current_std && ycArray.at(lastIndex) > ycArray.at(lastIndex-1) + SC_THRESHOLD_OFFSET
+            && current_poc > m_iLastSC + SC_DURATION) {
+            
+            // Save Yc for SC
+            m_iLastYcSC = current_yc;
+            
+            //            cout << "isSceneChange STD Bus error # 1: " << current_poc << endl;
+            // pop the spike + RESET the sum
+              sumYc = 0;
+//            sumYc -= current_yc;
+            
+//            ycArray.pop_back();
+            // clear the vector
+            ycArray.clear();
+            
+#if !SC_SLOW_STD
+            prev_variance = 0;
+#endif
+            
+            return true;
+        }
+    }
+    else
+    {
+//        if (current_yc > current_mean + factor*current_std
+//            && current_poc > m_iLastSC + SC_DURATION) {
+            if (current_yc > current_mean + factor*current_std
+                && current_poc > m_iLastSC + SC_DURATION
+                && current_yc > ycArray.at(lastIndex-1) + SC_THRESHOLD_OFFSET) {
+
+            
+            
+            // Save Yc for SC
+            m_iLastYcSC = current_yc;
+            
+            
+            //            cout << "isSceneChange STD Bus error # 2: " << current_poc << endl;
+            // pop the spike + RESET the sum
+            sumYc = 0;
+            //            sumYc -= current_yc;
+
+            // clear the vector
+            ycArray.clear();
+            //            ycArray.pop_back();
+            
+
+// Hossam: Scene change: You need to reset the previous variance in case of STD reset
+#if !SC_SLOW_STD
+            prev_variance = 0;
+#endif
+            
+            return true;
+        }
+    }
+    
+    
+    return false;
+}
+
+
+Double TEncSceneChange::getCurrentMean()
+{
+//    cout << "Current Mean: " << ( sumYc +  ycArray.at(ycArray.size()-1) )/ ycArray.size()<< endl;
+//    return  ( sumYc +  ycArray.at(ycArray.size()-1) )/ ycArray.size();
+    
+
+#if SC_DEBUG_STD
+    cout << "Current Mean: " << ( sumYc )/ ycArray.size()<< endl;
+    cout << "Current Sum: " << ( sumYc )<< endl;
+    cout << "Current Size: " << ( ycArray.size() )<< endl;
+#endif
+    
+//#if SC_DEBUG_STD
+//#if !SC_SLOW_STD
+//    cout << "Current previous variance: " << ( prev_variance )<< endl;
+//#endif
+//#endif
+    
+    return  sumYc  / ycArray.size();
+}
+
+// can be improved: Hossam
+Double TEncSceneChange::getCurrentStd(Double current_mean)
+{
+    Double sum = 0;
+    for (long index=0; index<(long)ycArray.size(); ++index) {
+        
+        Double current_yc = ycArray.at(index);
+        
+        sum = sum + (current_yc-current_mean)*(current_yc-current_mean);
+        
+    }
+    
+    Double variance = sum / ycArray.size();
+    Double std  = sqrt(variance);
+    
+
+#if SC_DEBUG_STD
+    cout << "Current STD: " << std << endl;
+#endif
+    
+//    cout << "Current Std: " << std << endl;;
+    return std;
+}
+
+
+
+//current_var = var(Yc(1:t))
+//
+//mean_t = mean(Yc(1:t));
+//var_t_1 = var(Yc(1:t-1));
+//% std_t_1 = std(Yc(1:t-1));
+//
+//current_var2 = ( Yc(t)- mean_t )*(Yc(t) - mean_t) / (t - 1) ...
+//+ ( (t - 1) / t )* var_t_1
+// can be improved: Hossam
+Double TEncSceneChange::getCurrentStdFast(Double mean_n)
+{
+    Double variance = 0;
+    Double std = 0;
+    
+    if(ycArray.size() == 1)
+    {
+        Double sum = 0;
+        for (long index=0; index<(long)ycArray.size(); ++index) {
+        
+            Double current_yc = ycArray.at(index);
+        
+            sum = sum + (current_yc-mean_n)*(current_yc-mean_n);
+        
+        }
+    
+         variance = sum / ycArray.size();
+        
+    }
+    else
+    {
+        // Reference: http://people.revoledu.com/kardi/tutorial/RecursiveStatistic/Time-Variance.htm
+        Int n       = ycArray.size();
+        Double yc_n = ycArray.back();
+        variance    = pow( yc_n - mean_n , 2) / (n - 1)
+                       + ( ( 1.0 * (n - 1) )  / n ) * prev_variance;
+        
+//        cout << "TERM 1 " << pow( yc_n - mean_n , 2) / (n - 1) << ", TERM 2: " << ( ( 1.0 * (n - 1) )  / n ) * prev_variance << endl;
+//        cout << "TERM 2A " << ( ( 1.0 * (n - 1) )  / n ) << ", TERM 2B: " << prev_variance << endl;
+    }
+    
+    
+#if SC_DEBUG_STD
+#if !SC_SLOW_STD
+    cout << "Current prev_variance Used in Calculations: " << prev_variance << ", PREVIOUS STD Used in Calculations: " <<  sqrt(prev_variance) << endl;
+#endif
+#endif
+    
+    // Set the previous variance to current_variance
+    prev_variance = variance;
+    
+    std  = sqrt(variance);
+    //    cout << "Current Std: " << std << endl;;
+    
+#if SC_DEBUG_STD
+#if !SC_SLOW_STD
+    cout << "Current prev_variance after calculations: " << prev_variance << endl;
+#endif
+    cout << "Current STD: " << std << endl;
+#endif
+    
+    return std;
+}
+
+
+// Hossam: isSmooth to detect the weak or strong correlation based on two frames
+Bool TEncSceneChange::isSmooth()
+{
+//   if(m_iLastSC > 0)
+//   {
+//       cout << "SMOOOTHHHH:" << endl;
+//       cout << m_iLastYcSC << ", " << m_iCurrentYc << ", " << (m_iLastYcSC - m_iCurrentYc > SC_SMOOTH_THRESH) << endl;
+//   }
+    
+
+    return true;
+    // Calculate the slope!
+//    return m_iLastSC > 0 && m_iLastYcSC - m_iCurrentYc > SC_SMOOTH_THRESH;
+ 
+}
+
+
+Double TEncSceneChange:: countOutliers(TComPicYuv *data, Double Yc)
+{
+    Double outliers = 0;
+    for(Int chan=0; chan < SC_COMPS_OUTLIERS; chan++) // only for Y component
+    {
+        
+        const ComponentID ch = ComponentID(chan);
+        Pel* pData = data->getAddr(ch);
+        const UInt uiFrameWidth = data->getWidth(ch);
+        const UInt uiFrameHeight = data->getHeight(ch);
+        const UInt sampleSize = uiFrameWidth*uiFrameHeight;
+        
+        for (Int i = 0; i < sampleSize; i++) {
+            if (pData[i] < Yc && pData[i] > -1*Yc ) {
+                outliers++;
+            }
+        }
+        
+    }
+    
+    return outliers;
+    
+}// end countOutliers
+
+
+Pel TEncSceneChange:: getMax(Pel* p, UInt uiWidth, UInt uiHeight)
+{
+    Pel max = -1000;
+    for (UInt y = 0; y < uiHeight; y++) {
+        for (UInt x = 0; x < uiWidth; x++) {
+            
+            if(max < p[x])
+                max = p[x];
+        }
+        
+        p = p + uiWidth;
+    }
+    
+    return max;
+}
+
+
+Pel TEncSceneChange::getMin(Pel* p, UInt uiWidth, UInt uiHeight)
+{
+    Pel min = +1000;
+    for (UInt y = 0; y < uiHeight; y++) {
+        for (UInt x = 0; x < uiWidth; x++) {
+            
+            if(min > p[x])
+                min = p[x];
+        }
+        
+        p = p + uiWidth;
+    }
+    
+    return min;
+}
+
+// ====================================================================================================================
+// Public member functions
+// ====================================================================================================================
+
+#if GEN_OUTLIER
+#if DCT_SIZE_IS_FOUR
+Void partialButterfly(TCoeff *src, TCoeff *dst, Int shift, Int line)
+{
+    Int j;
+    TCoeff E[2],O[2];
+    TCoeff add = (shift > 0) ? (1<<(shift-1)) : 0;
+    
+    for (j=0; j<line; j++)
+    {
+        /* E and O */
+        E[0] = src[0] + src[3];
+        O[0] = src[0] - src[3];
+        E[1] = src[1] + src[2];
+        O[1] = src[1] - src[2];
+        
+        dst[0]      = (g_aiT4[TRANSFORM_FORWARD][0][0]*E[0] + g_aiT4[TRANSFORM_FORWARD][0][1]*E[1] + add)>>shift;
+        dst[2*line] = (g_aiT4[TRANSFORM_FORWARD][2][0]*E[0] + g_aiT4[TRANSFORM_FORWARD][2][1]*E[1] + add)>>shift;
+        dst[line]   = (g_aiT4[TRANSFORM_FORWARD][1][0]*O[0] + g_aiT4[TRANSFORM_FORWARD][1][1]*O[1] + add)>>shift;
+        dst[3*line] = (g_aiT4[TRANSFORM_FORWARD][3][0]*O[0] + g_aiT4[TRANSFORM_FORWARD][3][1]*O[1] + add)>>shift;
+        
+        src += 4;
+        dst ++;
+    }
+}
+
+void partialButterflyInverse(TCoeff *src, TCoeff *dst, Int shift, Int line, const TCoeff outputMinimum, const TCoeff outputMaximum)
+{
+    Int j;
+    TCoeff E[2],O[2];
+    TCoeff add = (shift > 0) ? (1<<(shift-1)) : 0;
+    
+    for (j=0; j<line; j++)
+    {
+        /* Utilizing symmetry properties to the maximum to minimize the number of multiplications */
+        O[0] = g_aiT4[TRANSFORM_INVERSE][1][0]*src[line] + g_aiT4[TRANSFORM_INVERSE][3][0]*src[3*line];
+        O[1] = g_aiT4[TRANSFORM_INVERSE][1][1]*src[line] + g_aiT4[TRANSFORM_INVERSE][3][1]*src[3*line];
+        E[0] = g_aiT4[TRANSFORM_INVERSE][0][0]*src[0]    + g_aiT4[TRANSFORM_INVERSE][2][0]*src[2*line];
+        E[1] = g_aiT4[TRANSFORM_INVERSE][0][1]*src[0]    + g_aiT4[TRANSFORM_INVERSE][2][1]*src[2*line];
+        
+        /* Combining even and odd terms at each hierarchy levels to calculate the final spatial domain vector */
+        dst[0] = Clip3( outputMinimum, outputMaximum, (E[0] + O[0] + add)>>shift );
+        dst[1] = Clip3( outputMinimum, outputMaximum, (E[1] + O[1] + add)>>shift );
+        dst[2] = Clip3( outputMinimum, outputMaximum, (E[1] - O[1] + add)>>shift );
+        dst[3] = Clip3( outputMinimum, outputMaximum, (E[0] - O[0] + add)>>shift );
+        
+        src   ++;
+        dst += 4;
+    }
+}
+
+#else
+Void partialButterfly(TCoeff *src, TCoeff *dst, Int shift, Int line)
+{
+    Int j,k;
+    TCoeff E[4],O[4];
+    TCoeff EE[2],EO[2];
+    TCoeff add = (shift > 0) ? (1<<(shift-1)) : 0;
+    
+    for (j=0; j<line; j++)
+    {
+        /* E and O*/
+        for (k=0;k<4;k++)
+        {
+            E[k] = src[k] + src[7-k];
+            O[k] = src[k] - src[7-k];
+        }
+        /* EE and EO */
+        EE[0] = E[0] + E[3];
+        EO[0] = E[0] - E[3];
+        EE[1] = E[1] + E[2];
+        EO[1] = E[1] - E[2];
+        
+        dst[0]      = (g_aiT8[TRANSFORM_FORWARD][0][0]*EE[0] + g_aiT8[TRANSFORM_FORWARD][0][1]*EE[1] + add)>>shift;
+        dst[4*line] = (g_aiT8[TRANSFORM_FORWARD][4][0]*EE[0] + g_aiT8[TRANSFORM_FORWARD][4][1]*EE[1] + add)>>shift;
+        dst[2*line] = (g_aiT8[TRANSFORM_FORWARD][2][0]*EO[0] + g_aiT8[TRANSFORM_FORWARD][2][1]*EO[1] + add)>>shift;
+        dst[6*line] = (g_aiT8[TRANSFORM_FORWARD][6][0]*EO[0] + g_aiT8[TRANSFORM_FORWARD][6][1]*EO[1] + add)>>shift;
+        
+        dst[line]   = (g_aiT8[TRANSFORM_FORWARD][1][0]*O[0] + g_aiT8[TRANSFORM_FORWARD][1][1]*O[1] + g_aiT8[TRANSFORM_FORWARD][1][2]*O[2] + g_aiT8[TRANSFORM_FORWARD][1][3]*O[3] + add)>>shift;
+        dst[3*line] = (g_aiT8[TRANSFORM_FORWARD][3][0]*O[0] + g_aiT8[TRANSFORM_FORWARD][3][1]*O[1] + g_aiT8[TRANSFORM_FORWARD][3][2]*O[2] + g_aiT8[TRANSFORM_FORWARD][3][3]*O[3] + add)>>shift;
+        dst[5*line] = (g_aiT8[TRANSFORM_FORWARD][5][0]*O[0] + g_aiT8[TRANSFORM_FORWARD][5][1]*O[1] + g_aiT8[TRANSFORM_FORWARD][5][2]*O[2] + g_aiT8[TRANSFORM_FORWARD][5][3]*O[3] + add)>>shift;
+        dst[7*line] = (g_aiT8[TRANSFORM_FORWARD][7][0]*O[0] + g_aiT8[TRANSFORM_FORWARD][7][1]*O[1] + g_aiT8[TRANSFORM_FORWARD][7][2]*O[2] + g_aiT8[TRANSFORM_FORWARD][7][3]*O[3] + add)>>shift;
+        
+        src += 8;
+        dst ++;
+    }
+}
+void partialButterflyInverse(TCoeff *src, TCoeff *dst, Int shift, Int line, const TCoeff outputMinimum, const TCoeff outputMaximum)
+{
+    Int j,k;
+    TCoeff E[4],O[4];
+    TCoeff EE[2],EO[2];
+    TCoeff add = (shift > 0) ? (1<<(shift-1)) : 0;
+    
+    for (j=0; j<line; j++)
+    {
+        /* Utilizing symmetry properties to the maximum to minimize the number of multiplications */
+        for (k=0;k<4;k++)
+        {
+            O[k] = g_aiT8[TRANSFORM_INVERSE][ 1][k]*src[line]   + g_aiT8[TRANSFORM_INVERSE][ 3][k]*src[3*line] +
+            g_aiT8[TRANSFORM_INVERSE][ 5][k]*src[5*line] + g_aiT8[TRANSFORM_INVERSE][ 7][k]*src[7*line];
+        }
+        
+        EO[0] = g_aiT8[TRANSFORM_INVERSE][2][0]*src[ 2*line ] + g_aiT8[TRANSFORM_INVERSE][6][0]*src[ 6*line ];
+        EO[1] = g_aiT8[TRANSFORM_INVERSE][2][1]*src[ 2*line ] + g_aiT8[TRANSFORM_INVERSE][6][1]*src[ 6*line ];
+        EE[0] = g_aiT8[TRANSFORM_INVERSE][0][0]*src[ 0      ] + g_aiT8[TRANSFORM_INVERSE][4][0]*src[ 4*line ];
+        EE[1] = g_aiT8[TRANSFORM_INVERSE][0][1]*src[ 0      ] + g_aiT8[TRANSFORM_INVERSE][4][1]*src[ 4*line ];
+        
+        /* Combining even and odd terms at each hierarchy levels to calculate the final spatial domain vector */
+        E[0] = EE[0] + EO[0];
+        E[3] = EE[0] - EO[0];
+        E[1] = EE[1] + EO[1];
+        E[2] = EE[1] - EO[1];
+        for (k=0;k<4;k++)
+        {
+            dst[ k   ] = Clip3( outputMinimum, outputMaximum, (E[k] + O[k] + add)>>shift );
+            dst[ k+4 ] = Clip3( outputMinimum, outputMaximum, (E[3-k] - O[3-k] + add)>>shift );
+        }
+        src ++;
+        dst += 8;
+    }
+}
+
+#endif //dct size 4 or 8
+#endif
+
+#if GEN_OUTLIER
+
+static int liz = 0;
+Void TEncSceneChange::getOutlierWithDCT(TComPic* rpcPic)
+{
+    cout << "Outliers DCT " << liz++ << endl;
+    
+    //for(Int chan=0; chan < rpcPic->getNumberValidComponents(); chan++)
+    for(Int chan=0; chan < 1; chan++) // only for Y component
+    {
+        const ComponentID ch=ComponentID(chan);
+        
+        
+        TComPicYuv* data = rpcPic->getPicYuvOrg();
+        
+//        TComPicYuv* data = rpcPic->getPicYuvResi(); // get the residual frame
+        TComPicYuv* dataDst = rpcPic->getPicYuvOutlier();
+        
+        Pel* pData = data->getAddr(ch);
+        Pel* pDst = dataDst->getAddr(ch);
+        
+        UInt uiStrideDst = dataDst->getStride(ch);
+        UInt uiStrideSrc = data->getStride(ch);
+        
+        const UInt uiFrameWidth = data->getWidth(ch);
+        const UInt uiFrameHeight = data->getHeight(ch);
+        
+        //set start frequency for TCM
+        Int StartFreq = 1;
+        
+#if DCT_SIZE_IS_FOUR
+        Int DctSize = 4;
+        Double DctScaling = 32.0/4.0;
+#else
+        Int DctSize = 8;
+        Double DctScaling = 16.0;
+#endif
+        const Int maxTrDynamicRange = g_maxTrDynamicRange[toChannelType(ch)];
+        
+        TCoeff block[ MAX_TU_SIZE * MAX_TU_SIZE ];
+        TCoeff coeff[ MAX_TU_SIZE * MAX_TU_SIZE ];
+        
+        Int TRANSFORM_MATRIX_SHIFT = g_transformMatrixShift[TRANSFORM_FORWARD];
+        Int bitDepth = g_bitDepth[toChannelType(ch)];
+        
+        Int shift_1st = ((g_aucConvertToBit[DctSize] + 2) +  bitDepth + TRANSFORM_MATRIX_SHIFT) - maxTrDynamicRange;
+        Int shift_2nd = (g_aucConvertToBit[DctSize] + 2) + TRANSFORM_MATRIX_SHIFT;
+        
+        TCoeff tmp[ MAX_TU_SIZE * MAX_TU_SIZE ];
+        Int FrequencySize = DctSize*DctSize;
+        Int BlockPerRow = uiFrameWidth/DctSize;
+        Int BlockPerCol = uiFrameHeight/DctSize;
+        
+        Int** CoeffFrequency    = new Int* [FrequencySize];   //HM dct/scaling factor
+        Int** CoeffFrequencyOrg = new Int* [FrequencySize];   //HM dct, which may be different from actual dct
+        
+        UInt NumCoefInOneFreq = BlockPerCol*BlockPerRow;
+        for (Int x = 0 ; x<FrequencySize; x++)
+        {
+            CoeffFrequency[x]    = new Int[NumCoefInOneFreq];
+            CoeffFrequencyOrg[x] = new Int[NumCoefInOneFreq];
+        }
+        
+        //perform DCT for each 4x4 / 8x8 blcoks
+        for (Int Height = 0; Height < BlockPerCol; Height++)
+        {
+            for (Int Width = 0; Width < BlockPerRow; Width++)
+            {
+                //copy data to block for DCT
+                for (Int y = 0; y < DctSize; y++)
+                {
+                    for (Int x = 0 ; x < DctSize; x++)
+                    {
+                        block[(y * DctSize) + x] = pData[(y+Height*DctSize)*uiStrideSrc + Width*DctSize + x];
+                    }
+                }
+                
+                partialButterfly( block, tmp, shift_1st, DctSize );
+                partialButterfly( tmp, coeff, shift_2nd, DctSize );
+                
+                for (Int x = 0; x<FrequencySize; x++)
+                {
+                    CoeffFrequency[x][Width+Height*BlockPerRow]    = coeff[x]/DctScaling;
+                    CoeffFrequencyOrg[x][Width+Height*BlockPerRow] = coeff[x];
+                }
+                
+            }
+        } //DCT done
+        
+        //DC
+        if (StartFreq == 0)
+        {
+            Double MeanDC = 0.0; Double MeanDCOrg = 0.0;
+            for (Int x = 0; x<NumCoefInOneFreq ; x++)
+            {
+                MeanDC = MeanDC + CoeffFrequency[0][x];
+                MeanDCOrg = MeanDCOrg + CoeffFrequencyOrg[0][x];
+            }
+            MeanDC = MeanDC/(Double)(NumCoefInOneFreq );
+            MeanDCOrg = MeanDCOrg/(Double)(NumCoefInOneFreq);
+            for (Int x = 0; x<NumCoefInOneFreq; x++)
+            {
+                CoeffFrequency[0][x] = CoeffFrequency[0][x] - MeanDC;
+                CoeffFrequencyOrg[0][x] = CoeffFrequencyOrg[0][x] - MeanDCOrg;
+            }
+        }
+        else
+        {
+            memset(CoeffFrequencyOrg[0], 0, sizeof(Int)*NumCoefInOneFreq );
+            memset(CoeffFrequency[0]   , 0, sizeof(Int)*NumCoefInOneFreq );
+        }
+        
+        //perform TCM and get outlier Yc[x] for each frequency
+        Int peak; double prob, lambda;
+        double Yc[FrequencySize];
+        
+        for (Int x = StartFreq; x<FrequencySize; x++)
+        {
+            TCMprocessOneSequence2(CoeffFrequency[x], NumCoefInOneFreq, &peak, &prob, &lambda, &Yc[x] );
+        }
+        
+        Double count = 0;
+        for (Int x = StartFreq; x<FrequencySize; x++)
+        {
+            for (Int i = 0; i<NumCoefInOneFreq; i++)
+            {
+                if (CoeffFrequencyOrg[x][i]<Yc[x]*DctScaling && CoeffFrequencyOrg[x][i]>-Yc[x]*DctScaling)
+                {
+                    CoeffFrequencyOrg[x][i] = 0;
+                    
+                    count = count + 1;
+                }
+            }
+        }
+        
+        
+        cout << "COUNTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT: " << 100.0*(count/ (FrequencySize*NumCoefInOneFreq)) << endl;
+        
+        //Inverse DCT, Outlier in image domain, DC is set as 0
+        TRANSFORM_MATRIX_SHIFT = g_transformMatrixShift[TRANSFORM_INVERSE];
+        shift_1st = TRANSFORM_MATRIX_SHIFT + 1; //1 has been added to shift_1st at the expense of shift_2nd
+        shift_2nd = (TRANSFORM_MATRIX_SHIFT + maxTrDynamicRange - 1) - bitDepth;
+        const TCoeff clipMinimum = -(1 << maxTrDynamicRange);
+        const TCoeff clipMaximum =  (1 << maxTrDynamicRange) - 1;
+        
+        for (Int Height = 0; Height < BlockPerCol; Height++)
+        {
+            for (Int Width = 0; Width < BlockPerRow; Width++)
+            {
+#if DCT_DEBUG
+                cout << "\nOutlierCoeff: ";
+#endif
+                memset(coeff, 0, MAX_TU_SIZE * MAX_TU_SIZE*sizeof(TCoeff));
+                for (Int y = 0; y<DctSize; y++)
+                {
+#if DCT_DEBUG
+                    cout << "\n";
+#endif
+                    for (Int x = 0; x<DctSize; x++)
+                    {
+                        if (y*DctSize+x != 0)
+                        {
+                            coeff[y*DctSize+x] = CoeffFrequencyOrg[y*DctSize+x][Height*BlockPerRow+Width];
+#if DCT_DEBUG
+                            cout << coeff[y*DctSize+x]<<" , ";
+#endif
+                        }
+                    }
+                }
+#if DCT_DEBUG
+                cout << "\nInvDCT: ";
+#endif
+                
+                partialButterflyInverse( coeff, tmp, shift_1st, DctSize, clipMinimum, clipMaximum);
+                partialButterflyInverse( tmp, block, shift_2nd, DctSize, std::numeric_limits<Pel>::min(), std::numeric_limits<Pel>::max());
+                for (Int y = 0; y<DctSize; y++)
+                {
+#if DCT_DEBUG
+                    cout << "\n";
+#endif
+                    for (Int x = 0; x<DctSize; x++)
+                    {
+                        pDst[(y+Height*DctSize)*uiStrideDst+x+Width*DctSize] = block[y*DctSize+x];
+                        //Dest[(y+Height*DctSize)*Stride+x+Width*DctSize] = CoeffFrequencyOrg[y*DctSize+x][Height*BlockPerRow+Width]/DctScaling;
+                        
+                        if ( pDst[(y+Height*DctSize)*uiStrideDst+x+Width*DctSize] < 0)
+                            pDst[(y+Height*DctSize)*uiStrideDst+x+Width*DctSize] = -pDst[(y+Height*DctSize)*uiStrideDst+x+Width*DctSize];
+                        
+                        pDst[(y+Height*DctSize)*uiStrideDst+x+Width*DctSize] *= 3;
+                        if ( pDst[(y+Height*DctSize)*uiStrideDst+x+Width*DctSize] > 255)
+                            pDst[(y+Height*DctSize)*uiStrideDst+x+Width*DctSize] =255;
+#if DCT_DEBUG
+                        cout<<pDst[(y+Height*DctSize)*uiStrideDst+x+Width*DctSize]<<" , ";
+#endif
+                    }
+                }
+                
+            }
+        }
+#if OUT_OUTLIER
+        unsigned char *bufOrgTem = new unsigned char[uiFrameWidth];
+        for (UInt height = 0 ; height< uiFrameHeight; height++)
+        {
+            for (UInt width = 0; width < uiFrameWidth; width++)
+            {
+                bufOrgTem[width] = pDst[width];
+            }
+            OutlierYuvFile.write(reinterpret_cast<char*>(bufOrgTem), uiFrameWidth);
+            pDst += uiStrideDst;
+        }
+        delete[] bufOrgTem;
+#endif
+        for (Int x=0 ; x<FrequencySize; x++)
+        {
+            delete[] CoeffFrequency[x];
+            delete[] CoeffFrequencyOrg[x];
+        }
+        delete[] CoeffFrequency;
+        delete[] CoeffFrequencyOrg;
+    }
+    
+}
+#endif
+
+
+
+Void TEncSceneChange::deletePicBuffer()
+{
+    /*
+     // TComList<TComPic*>      m_cListPic;                     ///< dynamic list of pictures
+     //    TComList<TComPic*>::iterator iterPic = m_cListPic.begin();
+     //    Int iSize = Int( m_cListPic.size() );
+     
+     for ( Int i = 0; i < iSize; i++ )
+     {
+     TComPic* pcPic = *(iterPic++);
+     
+     pcPic->destroy();
+     delete pcPic;
+     pcPic = NULL;
+     }
+     */
+}
+
+Void TEncSceneChange::deleteSCList()
+{
+    
+    //    delete m_scList;
+    //    for(int i = 0; i<noSCs; i++)
+    //    {
+    //        delete m_scList[i];
+    //    }
+}
+
+
+//! \}
